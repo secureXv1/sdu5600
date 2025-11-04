@@ -1,0 +1,12 @@
+# ==== Requisitos principales ====
+PySide6>=6.10.0
+PySide6-Addons>=6.10.0
+PySide6-Essentials>=6.10.0
+pyqtgraph>=0.13.7
+pyserial>=3.5
+pillow>=10.3.0
+numpy>=2.3.0
+
+# ==== (Opcional) herramientas útiles ====
+# tqdm==4.66.5        # barra de progreso si agregas cargas largas
+# pyinstaller>=6.10.0 # para compilar a .exe en producción
