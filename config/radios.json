@@ -1,0 +1,27 @@
+{
+  "radios": [
+    {
+      "id": "R1",
+      "name": "HF ICOM 8600",
+      "type": "ICOM8600",
+      "serial_number": null,
+      "preferred_port": null,
+      "auto_detect": true
+    },
+    {
+      "id": "R2",
+      "name": "UHF HackRF",
+      "type": "HACKRF",
+      "device_index": null,
+      "auto_detect": true
+    },
+    {
+      "id": "R3",
+      "name": "AOR 5700 Inteligencia",
+      "type": "AOR5700",
+      "serial_number": null,
+      "preferred_port": null,
+      "auto_detect": true
+    }
+  ]
+}
