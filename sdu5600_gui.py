@@ -99,7 +99,8 @@ class SDUDriverSimulator(SDUDriverBase):
         self._connected = True
         self.connectedChanged.emit(True)
         self.idChanged.emit(self._device_id)
-        self.timer.start()
+        # El simulador no arranca hasta que el usuario pulse "Iniciar barrido".
+        self.timer.stop()
 
     def disconnect_device(self) -> None:
         self.timer.stop()
@@ -125,14 +126,13 @@ class SDUDriverSimulator(SDUDriverBase):
         stop = self.center + self.span // 2
         df = (stop - start) / (pts - 1)
         data = []
-        # Señales falsas: dos picos y ruido
+        # Señales simuladas: ruido de -90 dB y dos picos positivos
         for i in range(pts):
             f = int(start + i * df)
-            # patrones gaussianos + ruido
-            peak1 = -30 * math.exp(-((f - (self.center - self.span*0.15))**2) / (2*(self.span*0.02)**2))
-            peak2 = -20 * math.exp(-((f - (self.center + self.span*0.18))**2) / (2*(self.span*0.01)**2))
-            noise = -90 + random.random()*3
-            p = max(noise, peak1, peak2)
+            base_noise = -90 + (random.random() * 2 - 1)  # -91 a -89 dB aprox
+            sig1 = 35 * math.exp(-((f - (self.center - self.span*0.15))**2) / (2*(self.span*0.02)**2))
+            sig2 = 25 * math.exp(-((f - (self.center + self.span*0.18))**2) / (2*(self.span*0.01)**2))
+            p = base_noise + sig1 + sig2
             data.append((f, p))
         self.sweepReady.emit(data)
 
@@ -538,11 +538,18 @@ class MainWindow(QtWidgets.QMainWindow):
     def _set_sweep(self, start: bool):
         if start:
             self.lblInfo.setText("Barrido en curso… (Space para pausar)")
-            # En simulador, ya hay timer; en real, pedir barridos periódicos
+            # En simulador: arrancar/parar timer explícitamente
+            if USE_SIMULATOR and hasattr(self.driver, 'timer'):
+                self.driver.timer.start()
+            # En real: pedir barridos periódicos
             if not USE_SIMULATOR:
                 self._start_poll_timer()
         else:
             self.lblInfo.setText("Barrido detenido")
+            if USE_SIMULATOR and hasattr(self.driver, 'timer'):
+                self.driver.timer.stop()
+            if not USE_SIMULATOR:
+                self._stop_poll_timer()
             if not USE_SIMULATOR:
                 self._stop_poll_timer()
 
@@ -550,6 +557,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._set_sweep("en curso" not in self.lblInfo.text().lower())
 
     def _on_sweep(self, data: List[Tuple[int, float]]):
+        first = not self.last_sweep
         self.last_sweep = data
         xs = [f for f, _ in data]
         ys = [p for _, p in data]
@@ -563,6 +571,9 @@ class MainWindow(QtWidgets.QMainWindow):
         else:
             self.peak_buf = None
             self.peakCurve.setData([], [])
+        # Autoescala automática al primer barrido para que siempre se vea algo
+        if first:
+            self._autoscale()
 
     def _autoscale(self):
         self.plot.enableAutoRange(axis=pg.ViewBox.XYAxes, enable=True)
