@@ -11,8 +11,13 @@ class RadioManager:
         self._load_config(config_path)
 
     def _load_config(self, path):
-        data = json.loads(Path(path).read_text(encoding="utf-8"))
-        for cfg in data:
+        raw = Path(path).read_text(encoding="utf-8")
+        data = json.loads(raw)
+
+        # 👇 IMPORTANTE: leer lista desde la clave "radios"
+        radios_cfg = data.get("radios", []) if isinstance(data, dict) else data
+
+        for cfg in radios_cfg:
             driver = self._create_driver(cfg)
             self.radios.append({
                 "id": cfg["id"],
@@ -30,3 +35,4 @@ class RadioManager:
             return Aor5700Driver(cfg)
         else:
             raise ValueError(f"Tipo de radio no soportado: {t}")
+
