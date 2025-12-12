@@ -12,8 +12,15 @@
       "id": "R2",
       "name": "UHF HackRF",
       "type": "HACKRF",
-      "device_index": null,
-      "auto_detect": true
+      "device_index": 0,
+      "auto_detect": true,
+
+      "center_freq_hz": 435000000,
+      "span_hz": 20000000,
+      "bin_width_hz": 250000,
+      "lna_gain": 16,
+      "vga_gain": 16,
+      "amp": 0
     },
     {
       "id": "R3",
