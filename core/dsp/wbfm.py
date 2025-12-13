@@ -3,7 +3,6 @@ from __future__ import annotations
 import ctypes as C
 import os
 import queue
-import threading
 import time
 from pathlib import Path
 
@@ -11,16 +10,11 @@ import numpy as np
 import sounddevice as sd
 
 
-# =========================
-# DLL loader (Pothos first)
-# =========================
-
-def load_hackrf():
+def _load_hackrf_dll():
     search_dirs = [
-        Path(r"C:\Program Files\PothosSDR\bin"),      # primero Pothos (funciona con hackrf_transfer)
-        Path(__file__).resolve().parent,              # fallback tools/
+        Path(r"C:\Program Files\PothosSDR\bin"),
+        Path(__file__).resolve().parent,
     ]
-
     for d in search_dirs:
         if d.exists():
             os.add_dll_directory(str(d))
@@ -31,22 +25,16 @@ def load_hackrf():
             p = d / name
             if p.exists():
                 try:
-                    print(f"[DLL] Cargando {p}")
                     return C.CDLL(str(p))
                 except OSError as e:
                     last_err = e
-
-    raise FileNotFoundError(f"No pude cargar HackRF DLL. Error real: {last_err!r}")
-
-
-lib = load_hackrf()
+    raise RuntimeError(f"No pude cargar HackRF DLL. Error real: {last_err!r}")
 
 
-# =========================
-# ctypes declarations
-# =========================
+lib = _load_hackrf_dll()
 
 hackrf_device_p = C.c_void_p
+
 
 class hackrf_transfer(C.Structure):
     _fields_ = [
@@ -57,6 +45,7 @@ class hackrf_transfer(C.Structure):
         ("rx_ctx", C.c_void_p),
         ("tx_ctx", C.c_void_p),
     ]
+
 
 lib.hackrf_init.restype = C.c_int
 lib.hackrf_exit.restype = C.c_int
@@ -91,12 +80,7 @@ lib.hackrf_stop_rx.restype = C.c_int
 lib.hackrf_stop_rx.argtypes = [hackrf_device_p]
 
 
-# =========================
-# DSP helpers
-# =========================
-
 def fir_lowpass(num_taps: int, cutoff_hz: float, fs: float) -> np.ndarray:
-    """Windowed-sinc FIR lowpass."""
     fc = float(cutoff_hz) / float(fs)
     n = np.arange(num_taps) - (num_taps - 1) / 2.0
     h = 2 * fc * np.sinc(2 * fc * n)
@@ -104,22 +88,22 @@ def fir_lowpass(num_taps: int, cutoff_hz: float, fs: float) -> np.ndarray:
     h /= np.sum(h)
     return h.astype(np.float32)
 
+
 def fir_stream(x: np.ndarray, h: np.ndarray, zi: np.ndarray):
-    """Streaming FIR for float32."""
     x = x.astype(np.float32, copy=False)
     x2 = np.concatenate([zi, x])
     y = np.convolve(x2, h, mode="valid").astype(np.float32)
     new_zi = x2[-(len(h) - 1):].copy()
     return y, new_zi
 
+
 def fir_stream_cplx(iq: np.ndarray, h: np.ndarray, zi_r: np.ndarray, zi_i: np.ndarray):
-    """Streaming FIR for complex signal (filter I and Q separately)."""
     yr, zi_r = fir_stream(iq.real.astype(np.float32, copy=False), h, zi_r)
     yi, zi_i = fir_stream(iq.imag.astype(np.float32, copy=False), h, zi_i)
     return (yr + 1j * yi).astype(np.complex64), zi_r, zi_i
 
+
 def deemph(x: np.ndarray, fs: int, tau: float, state: float):
-    """FM de-emphasis 1-pole lowpass."""
     dt = 1.0 / float(fs)
     a = dt / (tau + dt)
     y = np.empty_like(x, dtype=np.float32)
@@ -130,61 +114,48 @@ def deemph(x: np.ndarray, fs: int, tau: float, state: float):
     return y, s
 
 
-# =========================
-# WBFM Stream (clean)
-# =========================
-
 class WBFMStream:
     """
-    WBFM (FM comercial) limpio:
-    - IQ fs=2.4 Msps
-    - Filtro canal (±120 kHz aprox) + decim x10 -> 240 ksps
-    - Demod FM en 240 ksps
-    - Filtro audio 15 kHz + decim x5 -> 48 ksps
-    - De-emphasis 75 us
+    FM comercial (WBFM) con 2 etapas:
+    2.4M -> (LP 120k) -> decim 10 -> 240k -> demod -> (LP 15k) -> decim 5 -> 48k
     """
 
     def __init__(self, freq_mhz: float):
         self.freq_hz = int(freq_mhz * 1e6)
 
-        # Rates
         self.fs = 2_400_000
         self.fs1 = 240_000
         self.audio_fs = 48_000
-
         self.decim1 = self.fs // self.fs1      # 10
         self.decim2 = self.fs1 // self.audio_fs # 5
 
-        # Gains (empieza conservador para evitar saturación)
+        # Gains base (ajusta luego desde UI)
         self.lna = 24
         self.vga = 12
         self.amp = 0
 
-        # FIR: canal antes de demod (en 2.4M)
-        # Corte 120 kHz (sirve para WBFM: canal ~200 kHz)
         self.chan_fir = fir_lowpass(129, 120_000.0, self.fs)
         self.chan_zi_r = np.zeros(len(self.chan_fir) - 1, dtype=np.float32)
         self.chan_zi_i = np.zeros(len(self.chan_fir) - 1, dtype=np.float32)
 
-        # FIR: audio en 240k (antes de bajar a 48k)
         self.aud_fir = fir_lowpass(129, 15_000.0, self.fs1)
         self.aud_zi = np.zeros(len(self.aud_fir) - 1, dtype=np.float32)
 
-        # States
         self.prev_iq = 0.0 + 0.0j
         self.de_state = 0.0
+        self.tau = 75e-6
 
-        # queue audio
         self.audio_q: queue.Queue[np.ndarray] = queue.Queue(maxsize=80)
 
-        # device
         self.dev = hackrf_device_p()
         self._cb = RX_CALLBACK(self._rx_cb)
-
-        # deemphasis time constant
-        self.tau = 75e-6  # Américas (si quieres 50e-6, cambia aquí)
+        self._running = False
 
     def start(self):
+        if self._running:
+            return
+        self._running = True
+
         rc = lib.hackrf_init()
         if rc != 0:
             raise RuntimeError(f"hackrf_init failed rc={rc}")
@@ -199,9 +170,6 @@ class WBFMStream:
         lib.hackrf_set_vga_gain(self.dev, self.vga)
         lib.hackrf_set_amp_enable(self.dev, 1 if self.amp else 0)
 
-        print(f"[FM DLL] {self.freq_hz/1e6:.3f} MHz | fs={self.fs} -> {self.fs1} -> {self.audio_fs}")
-        print(f"[FM DLL] Gains: LNA={self.lna} VGA={self.vga} AMP={self.amp} | Ctrl+C para detener")
-
         sd.default.samplerate = self.audio_fs
         sd.default.channels = 1
 
@@ -211,14 +179,15 @@ class WBFMStream:
 
         try:
             with sd.OutputStream(dtype="float32", blocksize=2048, callback=self._audio_cb):
-                while True:
+                while self._running:
                     time.sleep(0.2)
-        except KeyboardInterrupt:
-            pass
         finally:
             self.stop()
 
     def stop(self):
+        if not self._running:
+            return
+        self._running = False
         try:
             lib.hackrf_stop_rx(self.dev)
         except Exception:
@@ -233,12 +202,14 @@ class WBFMStream:
             pass
 
     def _rx_cb(self, transfer_ptr):
+        if not self._running:
+            return 0
+
         tr = transfer_ptr.contents
         n = int(tr.valid_length)
         if n <= 0:
             return 0
 
-        # IQ int8 intercalado I,Q
         buf_i8 = C.cast(tr.buffer, C.POINTER(C.c_int8))
         data = np.frombuffer(C.string_at(buf_i8, n), dtype=np.int8)
         if data.size < 4:
@@ -249,26 +220,22 @@ class WBFMStream:
         i = data[0::2].astype(np.float32)
         q = data[1::2].astype(np.float32)
         iq = (i + 1j * q) / 128.0
-        iq = iq - np.mean(iq)  # DC removal
+        iq = iq - np.mean(iq)
 
-        # 1) filtro de canal + decim x10 (2.4M -> 240k)
         iq_f, self.chan_zi_r, self.chan_zi_i = fir_stream_cplx(
             iq.astype(np.complex64), self.chan_fir, self.chan_zi_r, self.chan_zi_i
         )
         iq_240k = iq_f[::self.decim1]
 
-        # 2) demod FM en 240k
         x = np.empty_like(iq_240k)
         x[0] = self.prev_iq
         x[1:] = iq_240k[:-1]
         self.prev_iq = iq_240k[-1]
         fm = np.angle(iq_240k * np.conj(x)).astype(np.float32)
 
-        # 3) filtro audio (240k) + decim x5 (-> 48k)
         fm_f, self.aud_zi = fir_stream(fm, self.aud_fir, self.aud_zi)
         audio = fm_f[::self.decim2]
 
-        # 4) deemphasis + limiter suave
         audio, self.de_state = deemph(audio, self.audio_fs, self.tau, self.de_state)
         audio = np.tanh(audio * 2.2).astype(np.float32)
 
@@ -276,35 +243,24 @@ class WBFMStream:
             self.audio_q.put_nowait(audio)
         except queue.Full:
             pass
-
         return 0
 
     def _audio_cb(self, outdata, frames, _time, _status):
         out = np.zeros(frames, dtype=np.float32)
         filled = 0
-
         while filled < frames:
             try:
                 chunk = self.audio_q.get_nowait()
             except queue.Empty:
                 break
-
             n = min(frames - filled, chunk.size)
             out[filled:filled + n] = chunk[:n]
             filled += n
-
             rest = chunk[n:]
             if rest.size:
-                # reinsertar resto (si cabe)
                 try:
                     self.audio_q.put_nowait(rest)
                 except queue.Full:
                     pass
                 break
-
         outdata[:, 0] = out
-
-
-if __name__ == "__main__":
-    FM_MHZ = 91.4  # cambia aquí
-    WBFMStream(FM_MHZ).start()

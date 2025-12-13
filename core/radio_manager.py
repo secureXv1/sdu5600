@@ -1,21 +1,24 @@
 # core/radio_manager.py
 import json
 from pathlib import Path
+
 from drivers.hackrf_driver import HackRFDriver
 from drivers.icom8600_driver import Icom8600Driver
 from drivers.aor5700_driver import Aor5700Driver
 
+from core.audio_engine import AudioEngine
+
 
 class RadioManager:
-    def __init__(self, config_path="config/radios.json"):
+    def __init__(self, config_path: str = "config/radios.json"):
         self.radios = []
+        self.audio = AudioEngine()
         self._load_config(config_path)
 
-    def _load_config(self, path):
+    def _load_config(self, path: str):
         raw = Path(path).read_text(encoding="utf-8")
         data = json.loads(raw)
 
-        # Leer lista desde la clave "radios"
         radios_cfg = data.get("radios", []) if isinstance(data, dict) else data
 
         for cfg in radios_cfg:
@@ -23,8 +26,8 @@ class RadioManager:
             rtype = (cfg.get("type") or "").upper()
 
             self.radios.append({
-                "id": cfg["id"],
-                "name": cfg["name"],
+                "id": cfg.get("id"),
+                "name": cfg.get("name"),
                 "type": rtype,
                 "config": cfg,
                 "driver": driver,
@@ -34,14 +37,12 @@ class RadioManager:
         t = (cfg.get("type") or "").upper()
         if t == "HACKRF":
             return HackRFDriver(cfg)
-        elif t == "ICOM8600":
+        if t == "ICOM8600":
             return Icom8600Driver(cfg)
-        elif t == "AOR5700":
+        if t == "AOR5700":
             return Aor5700Driver(cfg)
-        else:
-            raise ValueError(f"Tipo de radio no soportado: {t}")
+        raise ValueError(f"Tipo de radio no soportado: {t}")
 
-    # Opcional: por si la UI quiere llamar a esto
     def connect_all(self):
         for r in self.radios:
             try:
@@ -51,3 +52,10 @@ class RadioManager:
 
     def get_radios(self):
         return self.radios
+
+    # ===== Audio control =====
+    def start_audio(self, freq_mhz: float, mode: str):
+        self.audio.start(freq_mhz, mode)
+
+    def stop_audio(self):
+        self.audio.stop()

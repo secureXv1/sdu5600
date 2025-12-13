@@ -1,10 +1,14 @@
 # ui/main_window.py
 from PySide6.QtWidgets import (
     QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
-    QStatusBar, QLabel, QSplitter, QFrame, QApplication
+    QStatusBar, QLabel, QSplitter, QFrame, QApplication,
+    QLineEdit, QComboBox, QPushButton, QMessageBox
 )
+
 from PySide6.QtCore import Qt, QTimer
 import pyqtgraph as pg
+import threading
+
 
 from core.radio_manager import RadioManager
 from .radio_card import RadioCard
@@ -200,6 +204,34 @@ class MainWindow(QMainWindow):
         self.lbl_status = QLabel("Listo · Estilo SDR")
         status.addPermanentWidget(self.lbl_status)
 
+
+        # =========================
+        #  Control MONITOR (Audio)
+        # =========================
+        self.is_monitoring = False
+
+        self.freq_edit = QLineEdit("91.4")
+        self.freq_edit.setFixedWidth(90)
+        self.freq_edit.setStyleSheet("padding:4px 6px; border:1px solid #1f2937; border-radius:6px; color:#e5e7eb; background:#0b1220;")
+
+        self.mode_combo = QComboBox()
+        self.mode_combo.addItems(["FM", "NFM"])
+        self.mode_combo.setStyleSheet("padding:4px 6px; border:1px solid #1f2937; border-radius:6px; color:#e5e7eb; background:#0b1220;")
+
+        self.btn_monitor = QPushButton("▶ MONITOR")
+        self.btn_monitor.setStyleSheet("""
+            QPushButton { background:#111827; border:1px solid #1f2937; border-radius:6px; padding:4px 10px; color:#e5e7eb; }
+            QPushButton:hover { background:#1f2937; }
+        """)
+        self.btn_monitor.clicked.connect(self._toggle_monitor)
+
+        status.addPermanentWidget(QLabel("  Freq (MHz):"))
+        status.addPermanentWidget(self.freq_edit)
+        status.addPermanentWidget(QLabel("  Mode:"))
+        status.addPermanentWidget(self.mode_combo)
+        status.addPermanentWidget(self.btn_monitor)
+
+
         # Tema oscuro general
         self._apply_theme()
 
@@ -223,10 +255,90 @@ class MainWindow(QMainWindow):
             }
         """)
 
+    def _parse_freq_mhz(self) -> float | None:
+        txt = (self.freq_edit.text() or "").strip().replace(",", ".")
+        try:
+            return float(txt)
+        except Exception:
+            return None
+
+    def _toggle_monitor(self):
+    # START MONITOR
+        if not self.is_monitoring:
+            freq = self._parse_freq_mhz()
+            if freq is None:
+                QMessageBox.warning(self, "Frecuencia", "Frecuencia inválida. Ej: 91.4")
+                return
+
+            mode = self.mode_combo.currentText().strip().upper()
+
+            # Validaciones básicas
+            if mode == "FM" and not (88.0 <= freq <= 108.0):
+                QMessageBox.warning(self, "FM", "FM (broadcast) normalmente es 88–108 MHz.")
+                return
+
+            # 1) Marcar estado + parar FFT
+            self.is_monitoring = True
+            self.spec_timer.stop()
+            self.btn_monitor.setText("⏹ STOP")
+            self.lbl_status.setText(f"Iniciando MONITOR {mode} · {freq:.3f} MHz ...")
+
+            # 2) IMPORTANTE: “soltar” el HackRFDriver de FFT (evita -5)
+            # (si tu driver tiene disconnect(), úsalo; si no, al menos marca no conectado)
+            try:
+                if self.hackrf_driver is not None:
+                    if hasattr(self.hackrf_driver, "disconnect"):
+                        try:
+                            self.hackrf_driver.disconnect()
+                        except Exception:
+                            pass
+                    self.hackrf_driver.connected = False
+            except Exception:
+                pass
+
+            # 3) Correr audio en hilo y capturar fallo
+            def _run_audio():
+                try:
+                    self.manager.start_audio(freq, mode)  # bloqueante
+                except Exception as e:
+                    # regresar a UI thread
+                    QTimer.singleShot(0, lambda: self._monitor_failed(str(e)))
+
+            threading.Thread(target=_run_audio, daemon=True).start()
+            return
+
+        # STOP MONITOR
+        try:
+            self.manager.stop_audio()
+        except Exception as e:
+            QMessageBox.warning(self, "STOP", f"Error al detener audio: {e}")
+
+        self.is_monitoring = False
+        self.btn_monitor.setText("▶ MONITOR")
+        self.lbl_status.setText("Listo · Estilo SDR")
+
+        # Reanudar FFT
+        self.spec_timer.start()
+
+    def _monitor_failed(self, err: str):
+        self.is_monitoring = False
+        self.btn_monitor.setText("▶ MONITOR")
+        self.lbl_status.setText(f"Monitor falló: {err}")
+        # volver a FFT
+        self.spec_timer.start()
+
+
+
+
+
     # --------------------------------------------------
     # Actualización de Spectrum + Waterfall desde HackRF
     # --------------------------------------------------
     def _update_from_hackrf(self):
+
+        if getattr(self, "is_monitoring", False):
+            return
+        
         if self.hackrf_driver is None:
             self.lbl_status.setText("HackRF no encontrado (revisa radios.json y drivers).")
             return
