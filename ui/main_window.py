@@ -56,8 +56,14 @@ class SpectrumWidget(QWidget):
         self.plot = pg.PlotWidget()
         self.plot.setBackground("#020617")
         self.plot.showGrid(x=True, y=True, alpha=0.2)
-        self.plot.setLabel("bottom", "Frecuencia", units="Hz")
+
+        # Etiquetas claras (MHz)
+        self.plot.setLabel("bottom", "Frecuencia", units="MHz")
         self.plot.setLabel("left", "Nivel", units="dB")
+
+        # IMPORTANTE: evita que el plot cambie rangos solo
+        self.plot.enableAutoRange(x=False, y=False)
+        self.plot.setYRange(-140, 0, padding=0.0)  # ajusta a tu gusto
 
         self.curve = self.plot.plot([], [], pen=pg.mkPen("#f9fafb", width=1.2))
 
@@ -69,20 +75,24 @@ class SpectrumWidget(QWidget):
 
         v.addWidget(self.plot)
 
-    def update_spectrum(self, freqs, levels):
-        if freqs is None or len(freqs) == 0:
+    def update_spectrum(self, freqs_hz, levels_db):
+        if freqs_hz is None or len(freqs_hz) == 0:
             return
-        self.curve.setData(freqs, levels)
 
-        # Fija rango X siempre al span recibido (evita sensación de “deslizamiento”)
+        # Pasa a MHz para que el eje sea legible
+        freqs_mhz = (freqs_hz / 1e6) if hasattr(freqs_hz, "__array__") else [f / 1e6 for f in freqs_hz]
+
+        self.curve.setData(freqs_mhz, levels_db)
+
+        # fija X al span recibido
         try:
-            self.plot.setXRange(float(freqs[0]), float(freqs[-1]), padding=0.0)
+            self.plot.setXRange(float(freqs_mhz[0]), float(freqs_mhz[-1]), padding=0.0)
         except Exception:
             pass
 
+    def set_tuned_freq_mhz(self, mhz: float):
+        self.tune_line.setPos(float(mhz))
 
-    def set_tuned_freq(self, hz: float):
-        self.tune_line.setPos(hz)
 
 
 class WaveformWidget(QWidget):
@@ -571,10 +581,11 @@ class MainWindow(QMainWindow):
         # Spectrum
         self.spectrum.update_spectrum(freqs, levels)
 
-        # marcador centro
-        center_idx = len(freqs) // 2
-        center_freq = freqs[center_idx]
-        self.spectrum.set_tuned_freq(center_freq)
+       
+        # Frecuencia sintonizada (la del control arriba)
+        tuned_mhz = float(self.freq_spin.value())
+        self.spectrum.set_tuned_freq_mhz(tuned_mhz)
+
 
         # Waterfall (vertical: apila líneas, no “desplaza x”)
         try:
@@ -593,8 +604,18 @@ class MainWindow(QMainWindow):
 
         span_mhz = (freqs[-1] - freqs[0]) / 1e6
         self.lbl_status.setText(
-            f"{self.active_device_name} · Centro {center_freq/1e6:,.3f} MHz · Span {span_mhz:,.3f} MHz"
+            f"{self.active_device_name} · Tuned {tuned_mhz:.6f} MHz · "
+            f"Rango {freqs[0]/1e6:.6f}–{freqs[-1]/1e6:.6f} MHz · Span {span_mhz:.3f} MHz"
         )
+
+        # Rango real del FFT para eje X del waterfall
+        try:
+            self.waterfall.set_freq_axis(freqs[0], freqs[-1])
+            self.waterfall.set_tuned_freq(float(self.freq_spin.value()) * 1e6)
+        except Exception:
+            pass
+
+
 
 
 if __name__ == "__main__":

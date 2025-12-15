@@ -4,6 +4,8 @@ from __future__ import annotations
 from PySide6.QtWidgets import QWidget, QVBoxLayout
 import pyqtgraph as pg
 import numpy as np
+from PySide6 import QtCore
+
 
 
 class WaterfallWidget(QWidget):
@@ -33,11 +35,27 @@ class WaterfallWidget(QWidget):
 
         self.view = pg.GraphicsLayoutWidget()
         self.plot = self.view.addPlot()
-        self.plot.setMouseEnabled(x=False, y=False)
-        self.plot.hideAxis("bottom")
+
+        self.plot.setMouseEnabled(x=True, y=False)
+        self.plot.showGrid(x=True, y=False, alpha=0.2)
+
+        # Mostrar eje X con MHz
+        self.plot.showAxis("bottom")
+        self.plot.setLabel("bottom", "Frecuencia", units="MHz")
+        self.plot.getAxis("bottom").setTextPen(pg.mkPen("#9ca3af"))
+        self.plot.getAxis("bottom").setPen(pg.mkPen("#374151"))
+
+        # Eje Y oculto (tiempo)
         self.plot.hideAxis("left")
 
+
+
+
         self.img_item = pg.ImageItem()
+        self.img_item = pg.ImageItem()
+        self.img_item.setOpts(axisOrder='row-major')  # <<< CLAVE: filas hacia abajo (Y), columnas hacia la derecha (X)
+        self.plot.addItem(self.img_item)
+
         self.plot.addItem(self.img_item)
 
         # Paleta tipo SDR
@@ -49,6 +67,16 @@ class WaterfallWidget(QWidget):
 
         self.img_item.setImage(self.img, autoLevels=False, levels=self.levels)
         layout.addWidget(self.view)
+
+        # Por defecto: eje X 0..(width-1) pero en MHz lo vamos a mapear con setRect
+        self._f_start_hz = 0.0
+        self._f_stop_hz = float(self.width)
+
+        self.img_item.setRect(QtCore.QRectF(self._f_start_hz/1e6, 0, (self._f_stop_hz-self._f_start_hz)/1e6, self.history_lines))
+
+
+
+
 
     # ----------------------------
     # Config
@@ -86,6 +114,32 @@ class WaterfallWidget(QWidget):
 
         self.img_item.setImage(self.img, autoLevels=False, levels=self.levels)
 
+        # Mantener mapeo X (MHz) al ancho actual
+        try:
+            self.img_item.setRect(QtCore.QRectF(self._f_start_hz/1e6, 0,
+                                                (self._f_stop_hz - self._f_start_hz)/1e6,
+                                                self.history_lines))
+        except Exception:
+            pass
+
+
+        self.tune_line = pg.InfiniteLine(angle=90, movable=False, pen=pg.mkPen("#22c55e", width=1.2))
+        self.plot.addItem(self.tune_line)
+
+
     def clear(self):
         self.img[:] = self.levels[0]
         self.img_item.setImage(self.img, autoLevels=False, levels=self.levels)
+
+
+
+    def set_freq_axis(self, start_hz: float, stop_hz: float):
+        """Define el rango de frecuencias visible en el eje X (en Hz)."""
+        self._f_start_hz = float(start_hz)
+        self._f_stop_hz = float(stop_hz)
+
+        self.plot.setXRange(self._f_start_hz / 1e6, self._f_stop_hz / 1e6, padding=0.0)
+
+    def set_tuned_freq(self, hz: float):
+        """Mueve el marcador verde al tuned (Hz)."""
+        self.tune_line.setPos(float(hz) / 1e6)
