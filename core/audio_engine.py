@@ -1,4 +1,3 @@
-from typing import Optional
 from core.dsp.wbfm import WBFMStream
 from core.dsp.nbfm import NBFMStream
 
@@ -6,13 +5,13 @@ class AudioEngine:
     def __init__(self):
         self.stream = None
 
-    def start(self, freq_mhz: float, mode: str):
+    def start(self, driver, mode: str):
         self.stop()
 
         if mode == "FM":
-            self.stream = WBFMStream(freq_mhz)
+            self.stream = WBFMStream(driver)
         elif mode == "NFM":
-            self.stream = NBFMStream(freq_mhz)
+            self.stream = NBFMStream(driver)
         else:
             raise ValueError(f"Modo no soportado: {mode}")
 

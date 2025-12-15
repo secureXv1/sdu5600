@@ -57,13 +57,11 @@ class SpectrumWidget(QWidget):
         self.plot.setBackground("#020617")
         self.plot.showGrid(x=True, y=True, alpha=0.2)
 
-        # Etiquetas claras (MHz)
         self.plot.setLabel("bottom", "Frecuencia", units="MHz")
         self.plot.setLabel("left", "Nivel", units="dB")
 
-        # IMPORTANTE: evita que el plot cambie rangos solo
         self.plot.enableAutoRange(x=False, y=False)
-        self.plot.setYRange(-140, 0, padding=0.0)  # ajusta a tu gusto
+        self.plot.setYRange(-140, 0, padding=0.0)
 
         self.curve = self.plot.plot([], [], pen=pg.mkPen("#f9fafb", width=1.2))
 
@@ -73,25 +71,50 @@ class SpectrumWidget(QWidget):
         )
         self.plot.addItem(self.tune_line)
 
+        # Overlay texto (arriba del espectro)
+        self._info = pg.TextItem(color="#e5e7eb", anchor=(0, 0))
+        self._info.setPos(0, 0)  # se reajusta con viewRange
+        self.plot.addItem(self._info)
+
         v.addWidget(self.plot)
 
-    def update_spectrum(self, freqs_hz, levels_db):
+    def update_spectrum(self, freqs_hz, levels_db, tuned_mhz: float | None = None):
         if freqs_hz is None or len(freqs_hz) == 0:
             return
 
-        # Pasa a MHz para que el eje sea legible
         freqs_mhz = (freqs_hz / 1e6) if hasattr(freqs_hz, "__array__") else [f / 1e6 for f in freqs_hz]
-
         self.curve.setData(freqs_mhz, levels_db)
 
         # fija X al span recibido
         try:
-            self.plot.setXRange(float(freqs_mhz[0]), float(freqs_mhz[-1]), padding=0.0)
+            x0 = float(freqs_mhz[0]); x1 = float(freqs_mhz[-1])
+            self.plot.setXRange(x0, x1, padding=0.0)
+        except Exception:
+            return
+
+        # Reposicionar overlay arriba-izquierda del view
+        try:
+            (xr, yr) = self.plot.viewRange()
+            self._info.setPos(xr[0], yr[1])  # esquina sup izq
+        except Exception:
+            pass
+
+        # Texto de rango/centro/span
+        try:
+            start = float(freqs_mhz[0])
+            end = float(freqs_mhz[-1])
+            center = (start + end) / 2.0
+            span = end - start
+            tuned_txt = f" | Tuned: {tuned_mhz:.6f} MHz" if tuned_mhz is not None else ""
+            self._info.setText(
+                f"Rango: {start:.6f} – {end:.6f} MHz | Centro: {center:.6f} MHz | Span: {span:.3f} MHz{tuned_txt}"
+            )
         except Exception:
             pass
 
     def set_tuned_freq_mhz(self, mhz: float):
         self.tune_line.setPos(float(mhz))
+
 
 
 
@@ -504,26 +527,13 @@ class MainWindow(QMainWindow):
                 return
 
             self.is_monitoring = True
-            self.spec_timer.stop()
             self.btn_monitor.setText("⏹ STOP")
-            self.lbl_status.setText(f"Iniciando MONITOR {mode} · {freq:.6f} MHz ...")
+            self.lbl_status.setText(f"MONITOR {mode} · {freq:.6f} MHz (spectro sigue activo)")
 
-            # soltar dispositivo activo si estaba en FFT
-            try:
-                if self.active_driver is not None:
-                    if hasattr(self.active_driver, "disconnect"):
-                        try:
-                            self.active_driver.disconnect()
-                        except Exception:
-                            pass
-                    if hasattr(self.active_driver, "connected"):
-                        self.active_driver.connected = False
-            except Exception:
-                pass
-
+            # Arranca audio SIN parar el espectro
             def _run_audio():
                 try:
-                    self.manager.start_audio(freq, mode)  # bloqueante
+                    self.manager.start_audio(self.active_driver, freq, mode)
                 except Exception as e:
                     QTimer.singleShot(0, lambda: self._monitor_failed(str(e)))
 
@@ -539,7 +549,7 @@ class MainWindow(QMainWindow):
         self.is_monitoring = False
         self.btn_monitor.setText("▶ MONITOR")
         self.lbl_status.setText("Listo · SDR Style")
-        self.spec_timer.start()
+
 
     def _monitor_failed(self, err: str):
         self.is_monitoring = False
@@ -549,9 +559,7 @@ class MainWindow(QMainWindow):
 
     # ---------- Update FFT + Waterfall ----------
     def _update_from_active_device(self):
-        if self.is_monitoring:
-            return
-
+       
         if self.active_driver is None:
             self.lbl_status.setText("No hay dispositivo activo.")
             return
@@ -579,11 +587,8 @@ class MainWindow(QMainWindow):
             return
 
         # Spectrum
-        self.spectrum.update_spectrum(freqs, levels)
-
-       
-        # Frecuencia sintonizada (la del control arriba)
         tuned_mhz = float(self.freq_spin.value())
+        self.spectrum.update_spectrum(freqs, levels, tuned_mhz=tuned_mhz)
         self.spectrum.set_tuned_freq_mhz(tuned_mhz)
 
 

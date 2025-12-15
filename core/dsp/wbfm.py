@@ -1,83 +1,10 @@
 from __future__ import annotations
 
-import ctypes as C
-import os
 import queue
+import threading
 import time
-from pathlib import Path
-
 import numpy as np
 import sounddevice as sd
-
-
-def _load_hackrf_dll():
-    search_dirs = [
-        Path(r"C:\Program Files\PothosSDR\bin"),
-        Path(__file__).resolve().parent,
-    ]
-    for d in search_dirs:
-        if d.exists():
-            os.add_dll_directory(str(d))
-
-    last_err = None
-    for d in search_dirs:
-        for name in ("hackrf.dll", "libhackrf.dll"):
-            p = d / name
-            if p.exists():
-                try:
-                    return C.CDLL(str(p))
-                except OSError as e:
-                    last_err = e
-    raise RuntimeError(f"No pude cargar HackRF DLL. Error real: {last_err!r}")
-
-
-lib = _load_hackrf_dll()
-
-hackrf_device_p = C.c_void_p
-
-
-class hackrf_transfer(C.Structure):
-    _fields_ = [
-        ("device", hackrf_device_p),
-        ("buffer", C.POINTER(C.c_uint8)),
-        ("buffer_length", C.c_int),
-        ("valid_length", C.c_int),
-        ("rx_ctx", C.c_void_p),
-        ("tx_ctx", C.c_void_p),
-    ]
-
-
-lib.hackrf_init.restype = C.c_int
-lib.hackrf_exit.restype = C.c_int
-
-lib.hackrf_open.restype = C.c_int
-lib.hackrf_open.argtypes = [C.POINTER(hackrf_device_p)]
-
-lib.hackrf_close.restype = C.c_int
-lib.hackrf_close.argtypes = [hackrf_device_p]
-
-lib.hackrf_set_freq.restype = C.c_int
-lib.hackrf_set_freq.argtypes = [hackrf_device_p, C.c_uint64]
-
-lib.hackrf_set_sample_rate.restype = C.c_int
-lib.hackrf_set_sample_rate.argtypes = [hackrf_device_p, C.c_double]
-
-lib.hackrf_set_lna_gain.restype = C.c_int
-lib.hackrf_set_lna_gain.argtypes = [hackrf_device_p, C.c_uint32]
-
-lib.hackrf_set_vga_gain.restype = C.c_int
-lib.hackrf_set_vga_gain.argtypes = [hackrf_device_p, C.c_uint32]
-
-lib.hackrf_set_amp_enable.restype = C.c_int
-lib.hackrf_set_amp_enable.argtypes = [hackrf_device_p, C.c_uint8]
-
-RX_CALLBACK = C.CFUNCTYPE(C.c_int, C.POINTER(hackrf_transfer))
-
-lib.hackrf_start_rx.restype = C.c_int
-lib.hackrf_start_rx.argtypes = [hackrf_device_p, RX_CALLBACK, C.c_void_p]
-
-lib.hackrf_stop_rx.restype = C.c_int
-lib.hackrf_stop_rx.argtypes = [hackrf_device_p]
 
 
 def fir_lowpass(num_taps: int, cutoff_hz: float, fs: float) -> np.ndarray:
@@ -116,24 +43,27 @@ def deemph(x: np.ndarray, fs: int, tau: float, state: float):
 
 class WBFMStream:
     """
-    FM comercial (WBFM) con 2 etapas:
-    2.4M -> (LP 120k) -> decim 10 -> 240k -> demod -> (LP 15k) -> decim 5 -> 48k
+    FM comercial (WBFM) desde IQ del driver (NO abre hardware).
+    Cadena diseñada para fs=2.4MHz:
+      2.4M -> (LP 120k) -> decim 10 -> 240k -> demod -> (LP 15k) -> decim 5 -> 48k
     """
 
-    def __init__(self, freq_mhz: float):
-        self.freq_hz = int(freq_mhz * 1e6)
+    def __init__(self, driver):
+        self.driver = driver
 
-        self.fs = 2_400_000
+        self.fs = int(getattr(driver, "sample_rate", 2_400_000))
+        if self.fs != 2_400_000:
+            raise RuntimeError(
+                f"WBFMStream requiere sample_rate=2_400_000 (actual={self.fs}). "
+                "Ajusta config/radios.json para HackRF."
+            )
+
         self.fs1 = 240_000
         self.audio_fs = 48_000
-        self.decim1 = self.fs // self.fs1      # 10
+        self.decim1 = self.fs // self.fs1       # 10
         self.decim2 = self.fs1 // self.audio_fs # 5
 
-        # Gains base (ajusta luego desde UI)
-        self.lna = 24
-        self.vga = 12
-        self.amp = 0
-
+        # filtros
         self.chan_fir = fir_lowpass(129, 120_000.0, self.fs)
         self.chan_zi_r = np.zeros(len(self.chan_fir) - 1, dtype=np.float32)
         self.chan_zi_i = np.zeros(len(self.chan_fir) - 1, dtype=np.float32)
@@ -141,121 +71,122 @@ class WBFMStream:
         self.aud_fir = fir_lowpass(129, 15_000.0, self.fs1)
         self.aud_zi = np.zeros(len(self.aud_fir) - 1, dtype=np.float32)
 
+        # demod state
         self.prev_iq = 0.0 + 0.0j
         self.de_state = 0.0
-        self.tau = 75e-6
+        self.tau = 75e-6  # WBFM
 
-        self.audio_q: queue.Queue[np.ndarray] = queue.Queue(maxsize=80)
+        # audio queue
+        self.audio_q: queue.Queue[np.ndarray] = queue.Queue(maxsize=120)
 
-        self.dev = hackrf_device_p()
-        self._cb = RX_CALLBACK(self._rx_cb)
         self._running = False
+        self._th: threading.Thread | None = None
+
+        # tamaño de bloque IQ a procesar
+        self.block_iq = 262_144  # ~109 ms @ 2.4Msps (ok)
 
     def start(self):
         if self._running:
             return
         self._running = True
 
-        rc = lib.hackrf_init()
-        if rc != 0:
-            raise RuntimeError(f"hackrf_init failed rc={rc}")
-
-        rc = lib.hackrf_open(C.byref(self.dev))
-        if rc != 0:
-            raise RuntimeError(f"hackrf_open failed rc={rc}")
-
-        lib.hackrf_set_sample_rate(self.dev, float(self.fs))
-        lib.hackrf_set_freq(self.dev, C.c_uint64(self.freq_hz))
-        lib.hackrf_set_lna_gain(self.dev, self.lna)
-        lib.hackrf_set_vga_gain(self.dev, self.vga)
-        lib.hackrf_set_amp_enable(self.dev, 1 if self.amp else 0)
-
         sd.default.samplerate = self.audio_fs
         sd.default.channels = 1
 
-        rc = lib.hackrf_start_rx(self.dev, self._cb, None)
-        if rc != 0:
-            raise RuntimeError(f"hackrf_start_rx failed rc={rc}")
+        self._th = threading.Thread(target=self._worker, daemon=True)
+        self._th.start()
 
-        try:
-            with sd.OutputStream(dtype="float32", blocksize=2048, callback=self._audio_cb):
-                while self._running:
-                    time.sleep(0.2)
-        finally:
-            self.stop()
+        # stream de salida (callback)
+        self._out = sd.OutputStream(dtype="float32", blocksize=2048, callback=self._audio_cb)
+        self._out.start()
 
     def stop(self):
         if not self._running:
             return
         self._running = False
+
         try:
-            lib.hackrf_stop_rx(self.dev)
-        except Exception:
-            pass
-        try:
-            lib.hackrf_close(self.dev)
-        except Exception:
-            pass
-        try:
-            lib.hackrf_exit()
+            if hasattr(self, "_out"):
+                self._out.stop()
+                self._out.close()
         except Exception:
             pass
 
-    def _rx_cb(self, transfer_ptr):
-        if not self._running:
-            return 0
+        if self._th:
+            self._th.join(timeout=1.0)
+            self._th = None
 
-        tr = transfer_ptr.contents
-        n = int(tr.valid_length)
-        if n <= 0:
-            return 0
-
-        buf_i8 = C.cast(tr.buffer, C.POINTER(C.c_int8))
-        data = np.frombuffer(C.string_at(buf_i8, n), dtype=np.int8)
-        if data.size < 4:
-            return 0
-        if data.size % 2:
-            data = data[:-1]
-
-        i = data[0::2].astype(np.float32)
-        q = data[1::2].astype(np.float32)
-        iq = (i + 1j * q) / 128.0
-        iq = iq - np.mean(iq)
-
-        iq_f, self.chan_zi_r, self.chan_zi_i = fir_stream_cplx(
-            iq.astype(np.complex64), self.chan_fir, self.chan_zi_r, self.chan_zi_i
-        )
-        iq_240k = iq_f[::self.decim1]
-
-        x = np.empty_like(iq_240k)
-        x[0] = self.prev_iq
-        x[1:] = iq_240k[:-1]
-        self.prev_iq = iq_240k[-1]
-        fm = np.angle(iq_240k * np.conj(x)).astype(np.float32)
-
-        fm_f, self.aud_zi = fir_stream(fm, self.aud_fir, self.aud_zi)
-        audio = fm_f[::self.decim2]
-
-        audio, self.de_state = deemph(audio, self.audio_fs, self.tau, self.de_state)
-        audio = np.tanh(audio * 2.2).astype(np.float32)
-
+        # limpia cola
         try:
-            self.audio_q.put_nowait(audio)
-        except queue.Full:
+            while True:
+                self.audio_q.get_nowait()
+        except Exception:
             pass
-        return 0
+
+    def _worker(self):
+        # loop de DSP (lee IQ del ring buffer)
+        while self._running:
+            iq = None
+            try:
+                iq = self.driver.get_latest_iq(self.block_iq)
+            except Exception:
+                iq = None
+
+            if iq is None or getattr(iq, "size", 0) < (self.fft_size_safe()):
+                time.sleep(0.02)
+                continue
+
+            # IQ complejo ya viene complex64
+            iq = iq.astype(np.complex64, copy=False)
+            iq = iq - np.mean(iq)
+
+            # Canal (LP) y decimación
+            iq_f, self.chan_zi_r, self.chan_zi_i = fir_stream_cplx(
+                iq, self.chan_fir, self.chan_zi_r, self.chan_zi_i
+            )
+            iq_240k = iq_f[::self.decim1]
+            if iq_240k.size < 8:
+                continue
+
+            # FM demod (discriminador por fase)
+            x = np.empty_like(iq_240k)
+            x[0] = self.prev_iq
+            x[1:] = iq_240k[:-1]
+            self.prev_iq = iq_240k[-1]
+            fm = np.angle(iq_240k * np.conj(x)).astype(np.float32)
+
+            # Audio LP + decimación
+            fm_f, self.aud_zi = fir_stream(fm, self.aud_fir, self.aud_zi)
+            audio = fm_f[::self.decim2]
+
+            # De-emphasis + limit suave
+            audio, self.de_state = deemph(audio, self.audio_fs, self.tau, self.de_state)
+            audio = np.tanh(audio * 2.2).astype(np.float32)
+
+            # push audio
+            try:
+                self.audio_q.put_nowait(audio)
+            except queue.Full:
+                pass
+
+    def fft_size_safe(self):
+        # mínimo para evitar problemas de tamaño
+        return 4096
 
     def _audio_cb(self, outdata, frames, _time, _status):
         out = np.zeros(frames, dtype=np.float32)
         filled = 0
+
         while filled < frames:
             try:
                 chunk = self.audio_q.get_nowait()
             except queue.Empty:
                 break
-            n = min(frames - filled, chunk.size)
+
+            n = min(frames - filled, int(chunk.size))
             out[filled:filled + n] = chunk[:n]
             filled += n
+
             rest = chunk[n:]
             if rest.size:
                 try:
@@ -263,4 +194,5 @@ class WBFMStream:
                 except queue.Full:
                     pass
                 break
+
         outdata[:, 0] = out
