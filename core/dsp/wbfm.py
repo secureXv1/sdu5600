@@ -74,16 +74,16 @@ class WBFMStream:
         self.iq_bytes_q = iq_bytes_queue
 
         # filtros
-        self.chan_fir = fir_lowpass(129, 120_000.0, self.fs)
+        self.chan_fir = fir_lowpass(161, 110_000.0, self.fs) #MEJORAR AUDIO
         self.chan_zi_r = np.zeros(len(self.chan_fir) - 1, dtype=np.float32)
         self.chan_zi_i = np.zeros(len(self.chan_fir) - 1, dtype=np.float32)
 
-        self.aud_fir = fir_lowpass(129, 15_000.0, self.fs1)
+        self.aud_fir = fir_lowpass(161, 14_000.0, self.fs1) #MEJORAR AUDIO
         self.aud_zi = np.zeros(len(self.aud_fir) - 1, dtype=np.float32)
 
         self.prev_iq = 0.0 + 0.0j
         self.de_state = 0.0
-        self.tau = 75e-6
+        self.tau = 90e-6 #MEJORAR AUDIO
 
         self.audio_q: queue.Queue[np.ndarray] = queue.Queue(maxsize=80)
 
@@ -151,7 +151,7 @@ class WBFMStream:
                 audio = fm_f[::self.decim2]
 
                 audio, self.de_state = deemph(audio, self.audio_fs, self.tau, self.de_state)
-                audio = np.tanh(audio * 2.2).astype(np.float32)
+                audio = np.tanh(audio * 1.2).astype(np.float32)
 
                 try:
                     self.audio_q.put_nowait(audio)
