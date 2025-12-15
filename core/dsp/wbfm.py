@@ -1,3 +1,4 @@
+# core/dsp/wbfm.py
 from __future__ import annotations
 
 import queue
@@ -41,27 +42,36 @@ def deemph(x: np.ndarray, fs: int, tau: float, state: float):
     return y, s
 
 
+def iq_from_int8_bytes(data: bytes) -> np.ndarray:
+    a = np.frombuffer(data, dtype=np.int8)
+    if a.size < 4:
+        return np.empty(0, dtype=np.complex64)
+    if a.size % 2:
+        a = a[:-1]
+    i = a[0::2].astype(np.float32)
+    q = a[1::2].astype(np.float32)
+    iq = (i + 1j * q) / 128.0
+    # DC remove
+    iq = iq - np.mean(iq)
+    return iq.astype(np.complex64, copy=False)
+
+
 class WBFMStream:
     """
-    FM comercial (WBFM) desde IQ del driver (NO abre hardware).
-    Cadena diseñada para fs=2.4MHz:
-      2.4M -> (LP 120k) -> decim 10 -> 240k -> demod -> (LP 15k) -> decim 5 -> 48k
+    WBFM desde cola de IQ bytes (I,Q int8 intercalado).
+    Pipeline:
+      2.4M -> LP 120k -> decim 10 -> 240k -> demod -> LP 15k -> decim 5 -> 48k
     """
+    def __init__(self, iq_bytes_queue: "queue.Queue[bytes]", freq_mhz: float):
+        self.freq_hz = int(freq_mhz * 1e6)
 
-    def __init__(self, driver):
-        self.driver = driver
-
-        self.fs = int(getattr(driver, "sample_rate", 2_400_000))
-        if self.fs != 2_400_000:
-            raise RuntimeError(
-                f"WBFMStream requiere sample_rate=2_400_000 (actual={self.fs}). "
-                "Ajusta config/radios.json para HackRF."
-            )
-
+        self.fs = 2_400_000
         self.fs1 = 240_000
         self.audio_fs = 48_000
         self.decim1 = self.fs // self.fs1       # 10
         self.decim2 = self.fs1 // self.audio_fs # 5
+
+        self.iq_bytes_q = iq_bytes_queue
 
         # filtros
         self.chan_fir = fir_lowpass(129, 120_000.0, self.fs)
@@ -71,122 +81,94 @@ class WBFMStream:
         self.aud_fir = fir_lowpass(129, 15_000.0, self.fs1)
         self.aud_zi = np.zeros(len(self.aud_fir) - 1, dtype=np.float32)
 
-        # demod state
         self.prev_iq = 0.0 + 0.0j
         self.de_state = 0.0
-        self.tau = 75e-6  # WBFM
+        self.tau = 75e-6
 
-        # audio queue
-        self.audio_q: queue.Queue[np.ndarray] = queue.Queue(maxsize=120)
+        self.audio_q: queue.Queue[np.ndarray] = queue.Queue(maxsize=80)
 
         self._running = False
-        self._th: threading.Thread | None = None
+        self._thr: threading.Thread | None = None
 
-        # tamaño de bloque IQ a procesar
-        self.block_iq = 262_144  # ~109 ms @ 2.4Msps (ok)
+        # bloque fijo (10 ms) => audio limpio y estable
+        self.block_iq = 24_000  # 2.4e6 * 0.010s
+        self._bytes_buf = b""
 
     def start(self):
         if self._running:
             return
         self._running = True
 
+        self._thr = threading.Thread(target=self._dsp_loop, daemon=True)
+        self._thr.start()
+
         sd.default.samplerate = self.audio_fs
         sd.default.channels = 1
 
-        self._th = threading.Thread(target=self._worker, daemon=True)
-        self._th.start()
-
-        # stream de salida (callback)
-        self._out = sd.OutputStream(dtype="float32", blocksize=2048, callback=self._audio_cb)
-        self._out.start()
+        try:
+            with sd.OutputStream(dtype="float32", blocksize=2048, callback=self._audio_cb):
+                while self._running:
+                    time.sleep(0.2)
+        finally:
+            self.stop()
 
     def stop(self):
-        if not self._running:
-            return
         self._running = False
 
-        try:
-            if hasattr(self, "_out"):
-                self._out.stop()
-                self._out.close()
-        except Exception:
-            pass
-
-        if self._th:
-            self._th.join(timeout=1.0)
-            self._th = None
-
-        # limpia cola
-        try:
-            while True:
-                self.audio_q.get_nowait()
-        except Exception:
-            pass
-
-    def _worker(self):
-        # loop de DSP (lee IQ del ring buffer)
+    def _dsp_loop(self):
+        need_bytes = int(self.block_iq) * 2  # I,Q int8
         while self._running:
-            iq = None
             try:
-                iq = self.driver.get_latest_iq(self.block_iq)
-            except Exception:
-                iq = None
-
-            if iq is None or getattr(iq, "size", 0) < (self.fft_size_safe()):
-                time.sleep(0.02)
+                chunk = self.iq_bytes_q.get(timeout=0.25)
+            except queue.Empty:
                 continue
 
-            # IQ complejo ya viene complex64
-            iq = iq.astype(np.complex64, copy=False)
-            iq = iq - np.mean(iq)
+            self._bytes_buf += chunk
 
-            # Canal (LP) y decimación
-            iq_f, self.chan_zi_r, self.chan_zi_i = fir_stream_cplx(
-                iq, self.chan_fir, self.chan_zi_r, self.chan_zi_i
-            )
-            iq_240k = iq_f[::self.decim1]
-            if iq_240k.size < 8:
-                continue
+            while self._running and len(self._bytes_buf) >= need_bytes:
+                raw = self._bytes_buf[:need_bytes]
+                self._bytes_buf = self._bytes_buf[need_bytes:]
 
-            # FM demod (discriminador por fase)
-            x = np.empty_like(iq_240k)
-            x[0] = self.prev_iq
-            x[1:] = iq_240k[:-1]
-            self.prev_iq = iq_240k[-1]
-            fm = np.angle(iq_240k * np.conj(x)).astype(np.float32)
+                iq = iq_from_int8_bytes(raw)
+                if iq.size < 8:
+                    continue
 
-            # Audio LP + decimación
-            fm_f, self.aud_zi = fir_stream(fm, self.aud_fir, self.aud_zi)
-            audio = fm_f[::self.decim2]
+                # canal
+                iq_f, self.chan_zi_r, self.chan_zi_i = fir_stream_cplx(
+                    iq, self.chan_fir, self.chan_zi_r, self.chan_zi_i
+                )
+                iq_240k = iq_f[::self.decim1]
 
-            # De-emphasis + limit suave
-            audio, self.de_state = deemph(audio, self.audio_fs, self.tau, self.de_state)
-            audio = np.tanh(audio * 2.2).astype(np.float32)
+                # demod FM
+                x = np.empty_like(iq_240k)
+                x[0] = self.prev_iq
+                x[1:] = iq_240k[:-1]
+                self.prev_iq = iq_240k[-1]
+                fm = np.angle(iq_240k * np.conj(x)).astype(np.float32)
 
-            # push audio
-            try:
-                self.audio_q.put_nowait(audio)
-            except queue.Full:
-                pass
+                # audio
+                fm_f, self.aud_zi = fir_stream(fm, self.aud_fir, self.aud_zi)
+                audio = fm_f[::self.decim2]
 
-    def fft_size_safe(self):
-        # mínimo para evitar problemas de tamaño
-        return 4096
+                audio, self.de_state = deemph(audio, self.audio_fs, self.tau, self.de_state)
+                audio = np.tanh(audio * 2.2).astype(np.float32)
+
+                try:
+                    self.audio_q.put_nowait(audio)
+                except queue.Full:
+                    pass
 
     def _audio_cb(self, outdata, frames, _time, _status):
         out = np.zeros(frames, dtype=np.float32)
         filled = 0
-
         while filled < frames:
             try:
                 chunk = self.audio_q.get_nowait()
             except queue.Empty:
                 break
-
-            n = min(frames - filled, int(chunk.size))
+            n = min(frames - filled, chunk.size)
             out[filled:filled + n] = chunk[:n]
             filled += n
-
             rest = chunk[n:]
             if rest.size:
                 try:
@@ -194,5 +176,4 @@ class WBFMStream:
                 except queue.Full:
                     pass
                 break
-
         outdata[:, 0] = out

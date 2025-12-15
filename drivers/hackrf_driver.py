@@ -13,6 +13,8 @@ from pathlib import Path
 import numpy as np
 
 from .base import RadioDriver
+import queue
+
 
 
 # --------------------------------------------------------------------
@@ -111,6 +113,10 @@ class IQRingBuffer:
         q = data_i8[1::2].astype(np.float32, copy=False)
         iq = (i + 1j * q) / 128.0
         self.push(iq.astype(np.complex64, copy=False))
+        iq = (i + 1j*q) / 128.0
+        iq = iq - np.mean(iq)   # <- importante para FM
+        self.push(iq.astype(np.complex64, copy=False))
+
 
     def push(self, iq: np.ndarray):
         iq = np.asarray(iq, dtype=np.complex64)
@@ -144,6 +150,8 @@ class IQRingBuffer:
             else:
                 out = np.concatenate((self.buf[start:], self.buf[:end])).copy()
         return out
+    
+
 
 
 # --------------------------------------------------------------------
@@ -181,6 +189,8 @@ class HackRFDriver(RadioDriver):
 
         # para estabilizar al tunear (scanner)
         self._last_tune_ts = 0.0
+
+        self._audio_bytes_q = queue.Queue(maxsize=200)  # ~1s aprox según tamaño de chunk
 
     # ---------- lifecycle ----------
     def connect(self):
@@ -298,7 +308,6 @@ class HackRFDriver(RadioDriver):
 
     # ---------- callback ----------
     def _rx_cb(self, transfer_ptr):
-        # OJO: este callback debe ser rápido
         if not self._rx_running:
             return 0
 
@@ -307,16 +316,25 @@ class HackRFDriver(RadioDriver):
         if n <= 0:
             return 0
 
-        # buffer uint8 -> int8 (sin copias grandes si es posible)
-        buf_i8 = C.cast(tr.buffer, C.POINTER(C.c_int8))
-        data = np.frombuffer(C.string_at(buf_i8, n), dtype=np.int8)
+        # lee bytes crudos UNA vez
+        raw = C.string_at(tr.buffer, n)
 
+        # 1) para FFT (ring buffer)
+        data = np.frombuffer(raw, dtype=np.int8)
         try:
             self.iqbuf.push_iq_int8(data)
         except Exception:
             pass
 
+        # 2) para audio (cola)
+        try:
+            self._audio_bytes_q.put_nowait(raw)
+        except Exception:
+            pass
+
         return 0
+
+
 
     # ---------- spectrum ----------
     def get_spectrum(self):
@@ -365,3 +383,7 @@ class HackRFDriver(RadioDriver):
 
     def set_mode(self, mode: str):
         pass
+
+    def get_audio_queue(self):
+        return self._audio_bytes_q
+

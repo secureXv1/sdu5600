@@ -55,10 +55,7 @@ class RadioManager:
 
     # ===== Audio control =====
     def start_audio(self, driver, freq_mhz: float, mode: str):
-        if hasattr(driver, "set_center_freq"):
-            driver.set_center_freq(freq_mhz * 1e6)
-        self.audio.start(driver, mode)
-
+        self.audio.start(driver, freq_mhz, mode)
 
 
 
