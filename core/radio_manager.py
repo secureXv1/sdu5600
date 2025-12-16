@@ -61,3 +61,7 @@ class RadioManager:
 
     def stop_audio(self):
         self.audio.stop()
+
+
+    def update_audio_params(self, **params):
+        self.audio.update_dsp_params(**params)

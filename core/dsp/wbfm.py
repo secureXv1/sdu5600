@@ -73,17 +73,20 @@ class WBFMStream:
 
         self.iq_bytes_q = iq_bytes_queue
 
-        # filtros
-        self.chan_fir = fir_lowpass(161, 110_000.0, self.fs) #MEJORAR AUDIO
-        self.chan_zi_r = np.zeros(len(self.chan_fir) - 1, dtype=np.float32)
-        self.chan_zi_i = np.zeros(len(self.chan_fir) - 1, dtype=np.float32)
+        # ---- Params en vivo (tuneables) ----
+        self._param_lock = threading.Lock()
+        self.chan_taps = 161
+        self.aud_taps = 161
+        self.chan_cutoff_hz = 110_000.0
+        self.aud_cutoff_hz = 14_000.0
+        self.tau = 90e-6
+        self.drive = 1.2
 
-        self.aud_fir = fir_lowpass(161, 14_000.0, self.fs1) #MEJORAR AUDIO
-        self.aud_zi = np.zeros(len(self.aud_fir) - 1, dtype=np.float32)
+        # filtros (reconstruibles en caliente)
+        self._rebuild_filters()
 
         self.prev_iq = 0.0 + 0.0j
         self.de_state = 0.0
-        self.tau = 90e-6 #MEJORAR AUDIO
 
         self.audio_q: queue.Queue[np.ndarray] = queue.Queue(maxsize=80)
 
@@ -94,6 +97,44 @@ class WBFMStream:
         self.block_iq = 24_000  # 2.4e6 * 0.010s
         self._bytes_buf = b""
 
+
+    def _rebuild_filters(self):
+        # clamp básico para evitar cutoffs inválidos
+        chan_cut = float(max(1.0, min(self.chan_cutoff_hz, (self.fs  * 0.49))))
+        aud_cut  = float(max(50.0, min(self.aud_cutoff_hz,  (self.fs1 * 0.49))))
+
+        self.chan_fir = fir_lowpass(int(self.chan_taps), chan_cut, self.fs)
+        self.chan_zi_r = np.zeros(len(self.chan_fir) - 1, dtype=np.float32)
+        self.chan_zi_i = np.zeros(len(self.chan_fir) - 1, dtype=np.float32)
+
+        self.aud_fir = fir_lowpass(int(self.aud_taps), aud_cut, self.fs1)
+        self.aud_zi = np.zeros(len(self.aud_fir) - 1, dtype=np.float32)
+
+    def update_params(
+        self,
+        chan_cutoff_hz: float | None = None,
+        aud_cutoff_hz: float | None = None,
+        tau_us: float | None = None,
+        drive: float | None = None,
+        chan_taps: int | None = None,
+        aud_taps: int | None = None,
+    ):
+        """Actualiza parámetros en caliente. tau_us en microsegundos."""
+        with self._param_lock:
+            if chan_cutoff_hz is not None:
+                self.chan_cutoff_hz = float(chan_cutoff_hz)
+            if aud_cutoff_hz is not None:
+                self.aud_cutoff_hz = float(aud_cutoff_hz)
+            if tau_us is not None:
+                self.tau = float(tau_us) * 1e-6
+            if drive is not None:
+                self.drive = float(drive)
+            if chan_taps is not None:
+                self.chan_taps = int(chan_taps)
+            if aud_taps is not None:
+                self.aud_taps = int(aud_taps)
+
+            self._rebuild_filters()
     def start(self):
         if self._running:
             return
@@ -151,7 +192,9 @@ class WBFMStream:
                 audio = fm_f[::self.decim2]
 
                 audio, self.de_state = deemph(audio, self.audio_fs, self.tau, self.de_state)
-                audio = np.tanh(audio * 1.2).astype(np.float32)
+                with self._param_lock:
+                    drive = float(self.drive)
+                audio = np.tanh(audio * drive).astype(np.float32)
 
                 try:
                     self.audio_q.put_nowait(audio)

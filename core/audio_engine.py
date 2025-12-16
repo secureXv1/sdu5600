@@ -13,6 +13,7 @@ class AudioEngine:
     """
     def __init__(self):
         self.stream = None
+        self.pending_params: dict = {}
 
     def start(self, driver, freq_mhz: float, mode: str):
         self.stop()
@@ -41,6 +42,18 @@ class AudioEngine:
         else:
             raise ValueError(f"Modo no soportado: {mode}")
 
+        # aplica parámetros pendientes (si el UI los envió antes de iniciar)
+
+        if self.pending_params and hasattr(self.stream, 'update_params'):
+
+            try:
+
+                self.stream.update_params(**self.pending_params)
+
+            except Exception:
+
+                pass
+
         self.stream.start()
 
     def stop(self):
@@ -50,3 +63,19 @@ class AudioEngine:
             except Exception:
                 pass
             self.stream = None
+
+
+    def update_dsp_params(self, **params):
+        """Actualiza parámetros DSP del stream activo; si no hay stream, quedan pendientes."""
+        if not params:
+            return
+        if self.stream and hasattr(self.stream, 'update_params'):
+            try:
+                self.stream.update_params(**params)
+                # también guarda como default para el próximo start
+                self.pending_params.update(params)
+                return
+            except Exception:
+                pass
+        # si no hay stream todavía, quedan guardados para aplicar al iniciar
+        self.pending_params.update(params)

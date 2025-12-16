@@ -6,7 +6,7 @@ from PySide6.QtWidgets import (
     QStatusBar, QLabel, QSplitter, QFrame, QApplication,
     QComboBox, QPushButton, QMessageBox,
     QDockWidget, QGroupBox, QFormLayout, QCheckBox,
-    QDoubleSpinBox
+    QDoubleSpinBox, QSpinBox
 )
 from PySide6.QtCore import Qt, QTimer
 from PySide6.QtGui import QAction, QFont
@@ -259,6 +259,9 @@ class MainWindow(QMainWindow):
         
         self._build_radios_dock_hidden()
 
+        self._build_audio_dsp_dock()
+
+
         # =========================
         #  Barra de estado
         # =========================
@@ -378,6 +381,76 @@ class MainWindow(QMainWindow):
         self.addDockWidget(Qt.LeftDockWidgetArea, self.radios_dock)
         self.radios_dock.hide()  # oculto por defecto
 
+
+    def _build_audio_dsp_dock(self):
+        panel = QWidget()
+        f = QFormLayout(panel)
+        f.setContentsMargins(10, 10, 10, 10)
+
+        self.dsp_chan_cut = QDoubleSpinBox()
+        self.dsp_chan_cut.setRange(1_000.0, 500_000.0)
+        self.dsp_chan_cut.setSingleStep(5_000.0)
+        self.dsp_chan_cut.setValue(110_000.0)
+
+        self.dsp_aud_cut = QDoubleSpinBox()
+        self.dsp_aud_cut.setRange(1_000.0, 30_000.0)
+        self.dsp_aud_cut.setSingleStep(500.0)
+        self.dsp_aud_cut.setValue(14_000.0)
+
+        self.dsp_tau = QDoubleSpinBox()
+        self.dsp_tau.setRange(1.0, 2_000.0)
+        self.dsp_tau.setSingleStep(5.0)
+        self.dsp_tau.setValue(90.0)
+
+        self.dsp_drive = QDoubleSpinBox()
+        self.dsp_drive.setRange(0.1, 5.0)
+        self.dsp_drive.setSingleStep(0.1)
+        self.dsp_drive.setValue(1.2)
+
+        self.dsp_chan_taps = QSpinBox()
+        self.dsp_chan_taps.setRange(31, 401)
+        self.dsp_chan_taps.setSingleStep(2)
+        self.dsp_chan_taps.setValue(161)
+
+        self.dsp_aud_taps = QSpinBox()
+        self.dsp_aud_taps.setRange(31, 401)
+        self.dsp_aud_taps.setSingleStep(2)
+        self.dsp_aud_taps.setValue(161)
+
+        self.btn_apply_dsp = QPushButton("Aplicar")
+        self.btn_apply_dsp.clicked.connect(self._apply_audio_dsp_params)
+
+        f.addRow("FM Canal cutoff (Hz)", self.dsp_chan_cut)
+        f.addRow("Audio cutoff (Hz)", self.dsp_aud_cut)
+        f.addRow("De-emphasis tau (µs)", self.dsp_tau)
+        f.addRow("Drive (tanh)", self.dsp_drive)
+        f.addRow("Canal taps", self.dsp_chan_taps)
+        f.addRow("Audio taps", self.dsp_aud_taps)
+        f.addRow("", self.btn_apply_dsp)
+
+        self.audio_dsp_dock = QDockWidget("Audio DSP", self)
+        self.audio_dsp_dock.setWidget(panel)
+        self.audio_dsp_dock.setAllowedAreas(Qt.LeftDockWidgetArea | Qt.RightDockWidgetArea)
+        self.addDockWidget(Qt.RightDockWidgetArea, self.audio_dsp_dock)
+        self.audio_dsp_dock.hide()
+
+
+    def _apply_audio_dsp_params(self):
+        params = self._collect_audio_dsp_params()
+        if not params:
+            return
+        try:
+            self.manager.update_audio_params(**params)
+            self.lbl_status.setText(
+                "DSP actualizado: "
+                f"chan={params['chan_cutoff_hz']:.0f}Hz, aud={params['aud_cutoff_hz']:.0f}Hz, "
+                f"tau={params['tau_us']:.0f}us, drive={params['drive']:.2f}"
+            )
+        except Exception as e:
+            QMessageBox.warning(self, "Audio DSP", f"No se pudo aplicar: {e}")
+
+
+
     # ---------- Menús ----------
     def _build_menus(self):
         mb = self.menuBar()
@@ -399,6 +472,15 @@ class MainWindow(QMainWindow):
         self.act_radios.setChecked(False)
         self.act_radios.triggered.connect(self.radios_dock.setVisible)
         m_view.addAction(self.act_radios)
+
+        self.act_audio_dsp = QAction("Audio DSP", self, checkable=True)
+        self.act_audio_dsp.setChecked(False)
+        self.act_audio_dsp.triggered.connect(self._toggle_audio_dsp_dock)
+
+        m_view.addAction(self.act_audio_dsp)
+
+        self.audio_dsp_dock.visibilityChanged.connect(self.act_audio_dsp.setChecked)
+
 
         # sincroniza checkmarks si cierran con la X
         self.controls_dock.visibilityChanged.connect(self.act_controls.setChecked)
@@ -516,6 +598,30 @@ class MainWindow(QMainWindow):
 
 
     # ---------- Monitor ----------
+    
+    def _collect_audio_dsp_params(self) -> dict:
+        """Lee valores del dock (si existe) y retorna params para el stream."""
+        if not hasattr(self, "dsp_chan_cut"):
+            return {}
+        return dict(
+            chan_cutoff_hz=float(self.dsp_chan_cut.value()),
+            aud_cutoff_hz=float(self.dsp_aud_cut.value()),
+            tau_us=float(self.dsp_tau.value()),
+            drive=float(self.dsp_drive.value()),
+            chan_taps=int(self.dsp_chan_taps.value()) if hasattr(self, "dsp_chan_taps") else 161,
+            aud_taps=int(self.dsp_aud_taps.value()) if hasattr(self, "dsp_aud_taps") else 161,
+        )
+
+    def _prime_audio_dsp_defaults(self):
+        """Envía al motor los defaults del dock (se aplican al iniciar monitor)."""
+        params = self._collect_audio_dsp_params()
+        if not params:
+            return
+        try:
+            self.manager.update_audio_params(**params)
+        except Exception:
+            pass
+
     def _toggle_monitor(self):
         # START MONITOR
         if not self.is_monitoring:
@@ -525,6 +631,10 @@ class MainWindow(QMainWindow):
             if mode == "FM" and not (88.0 <= freq <= 108.0):
                 QMessageBox.warning(self, "FM", "FM (broadcast) normalmente es 88–108 MHz.")
                 return
+
+
+            # Cargar parámetros del dock automáticamente (se aplican al iniciar el stream)
+            self._prime_audio_dsp_defaults()
 
             self.is_monitoring = True
             self.btn_monitor.setText("⏹ STOP")
@@ -556,6 +666,14 @@ class MainWindow(QMainWindow):
         self.btn_monitor.setText("▶ MONITOR")
         self.lbl_status.setText(f"Monitor falló: {err}")
         self.spec_timer.start()
+
+
+    def _toggle_audio_dsp_dock(self, checked=None):
+        # checked puede venir como bool o None dependiendo de la señal
+        if checked is None:
+            checked = not self.audio_dsp_dock.isVisible()
+        self.audio_dsp_dock.setVisible(bool(checked))
+
 
     # ---------- Update FFT + Waterfall ----------
     def _update_from_active_device(self):
