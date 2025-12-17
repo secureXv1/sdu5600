@@ -231,7 +231,7 @@ class WBFMStream:
                     pass
                 break
 
-                    # TAP para grabación (ScannerEngine)
+        # ✅ TAP para grabación (ScannerEngine) — fuera del while
         if self.on_audio is not None and filled > 0:
             try:
                 self.on_audio(out[:filled].copy())
@@ -239,3 +239,4 @@ class WBFMStream:
                 pass
 
         outdata[:, 0] = out
+

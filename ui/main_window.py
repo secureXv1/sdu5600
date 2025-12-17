@@ -827,6 +827,38 @@ class MainWindow(QMainWindow):
         self.scanner_dock.setVisible(bool(checked))
 
 
+    def _scan_status_from_thread(self, st):
+        """Recibe ScanStatus desde el hilo del scanner; lo pasamos al hilo UI."""
+        try:
+            QTimer.singleShot(0, lambda s=st: self._apply_scan_status(s))
+        except Exception:
+            pass
+
+    def _apply_scan_status(self, st):
+        """Actualiza dial/estado visual del escaneo."""
+        try:
+            # Dial sin disparar auto-tune del UI
+            self.freq_spin.blockSignals(True)
+            self.freq_spin.setValue(float(st.freq_mhz))
+            self.freq_spin.blockSignals(False)
+
+            # Línea verde de sintonía + waterfall
+            self.spectrum.set_tuned_freq_mhz(float(st.freq_mhz))
+            try:
+                self.waterfall.set_tuned_freq(float(st.freq_mhz) * 1e6)
+            except Exception:
+                pass
+
+            # Estado en panel escáner
+            if hasattr(self, "lbl_scan_status"):
+                self.lbl_scan_status.setText(
+                    f"{st.state} · [{st.bank_kind.upper()}] {st.bank_name} · {st.freq_mhz:.6f} MHz · {st.level_db:.1f} dB"
+                )
+        except Exception:
+            pass
+
+
+
     def _toggle_scan(self):
         # 1) Validaciones base
         driver = getattr(self, "active_driver", None)
@@ -890,7 +922,14 @@ class MainWindow(QMainWindow):
         try:
             # Opcional: pasar el filtro al scanner si tu ScannerEngine lo soporta
             # Por ahora, el scanner puede leer bancos activos (freq+range)
-            self.scanner.start(driver)
+            kind = {
+                "Todos": "ALL",
+                "Frecuencias": "FREQ",
+                "Rangos": "RANGE",
+            }.get(flt, "ALL")
+
+            self.scanner.start(driver, kind_filter=kind, on_status=self._scan_status_from_thread)
+
 
             self.btn_scan.setText("Detener escáner")
             if hasattr(self, "lbl_scan_status"):
