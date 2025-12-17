@@ -62,7 +62,7 @@ class WBFMStream:
     Pipeline:
       2.4M -> LP 120k -> decim 10 -> 240k -> demod -> LP 15k -> decim 5 -> 48k
     """
-    def __init__(self, iq_bytes_queue: "queue.Queue[bytes]", freq_mhz: float):
+    def __init__(self, iq_bytes_queue: "queue.Queue[bytes]", freq_mhz: float, on_audio=None):
         self.freq_hz = int(freq_mhz * 1e6)
 
         self.fs = 2_400_000
@@ -96,6 +96,11 @@ class WBFMStream:
         # bloque fijo (10 ms) => audio limpio y estable
         self.block_iq = 24_000  # 2.4e6 * 0.010s
         self._bytes_buf = b""
+        self.on_audio = on_audio  # callback opcional para grabación
+        self._stop_evt = threading.Event()
+
+
+
 
 
     def _rebuild_filters(self):
@@ -140,6 +145,9 @@ class WBFMStream:
             return
         self._running = True
 
+        self._stop_evt.clear()
+
+
         self._thr = threading.Thread(target=self._dsp_loop, daemon=True)
         self._thr.start()
 
@@ -148,13 +156,16 @@ class WBFMStream:
 
         try:
             with sd.OutputStream(dtype="float32", blocksize=2048, callback=self._audio_cb):
-                while self._running:
-                    time.sleep(0.2)
+                while self._running and not self._stop_evt.is_set():
+                    time.sleep(0.05)
+
         finally:
             self.stop()
 
     def stop(self):
         self._running = False
+        self._stop_evt.set()
+
 
     def _dsp_loop(self):
         need_bytes = int(self.block_iq) * 2  # I,Q int8
@@ -219,4 +230,12 @@ class WBFMStream:
                 except queue.Full:
                     pass
                 break
+
+                    # TAP para grabación (ScannerEngine)
+        if self.on_audio is not None and filled > 0:
+            try:
+                self.on_audio(out[:filled].copy())
+            except Exception:
+                pass
+
         outdata[:, 0] = out

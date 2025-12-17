@@ -18,6 +18,8 @@ from core.radio_manager import RadioManager
 from .radio_card import RadioCard
 from .waterfall_widget import WaterfallWidget
 from drivers.hackrf_driver import HackRFDriver
+from core.banks_store import BanksStore
+from core.scanner_engine import ScannerEngine
 
 
 class RibbonBar(QWidget):
@@ -199,6 +201,8 @@ class MainWindow(QMainWindow):
         self.manager = RadioManager()
         self.cards: list[RadioCard] = []
         self.device_map = {}  # name -> driver
+        self.banks_store = BanksStore("config/banks.json")
+        self.scanner = ScannerEngine(self.manager, self.banks_store, recordings_root="recordings")
 
         for radio_cfg in self.manager.radios:
             card = RadioCard(radio_cfg["name"], radio_cfg["driver"])
@@ -260,6 +264,8 @@ class MainWindow(QMainWindow):
         self._build_radios_dock_hidden()
 
         self._build_audio_dsp_dock()
+        self._build_scanner_dock()
+
 
 
         # =========================
@@ -370,6 +376,21 @@ class MainWindow(QMainWindow):
         self.controls_dock.setAllowedAreas(Qt.LeftDockWidgetArea | Qt.RightDockWidgetArea)
         self.addDockWidget(Qt.LeftDockWidgetArea, self.controls_dock)
         self.controls_dock.show()
+
+    def _build_scanner_dock(self):
+        w = QWidget()
+        lay = QVBoxLayout(w)
+
+        self.btn_scan = QPushButton("Iniciar escáner")
+        self.btn_scan.clicked.connect(self._toggle_scan)
+
+        lay.addWidget(self.btn_scan)
+
+        self.scanner_dock = QDockWidget("Escáner", self)
+        self.scanner_dock.setWidget(w)
+        self.addDockWidget(Qt.RightDockWidgetArea, self.scanner_dock)
+        self.scanner_dock.hide()
+    
 
 
 
@@ -485,6 +506,21 @@ class MainWindow(QMainWindow):
         # sincroniza checkmarks si cierran con la X
         self.controls_dock.visibilityChanged.connect(self.act_controls.setChecked)
         self.radios_dock.visibilityChanged.connect(self.act_radios.setChecked)
+
+        m_banks = mb.addMenu("Bancos / Memorias")
+
+        self.act_manage_banks = QAction("Administrar bancos…", self)
+        self.act_manage_banks.triggered.connect(self._open_banks_dialog)
+        m_banks.addAction(self.act_manage_banks)
+
+        self.act_scanner_panel = QAction("Panel Escáner", self, checkable=True)
+        self.act_scanner_panel.triggered.connect(self._toggle_scanner_dock)
+        m_banks.addAction(self.act_scanner_panel)
+        self.scanner_dock.visibilityChanged.connect(self.act_scanner_panel.setChecked)
+        self.act_scanner_panel.setChecked(False)
+
+
+
 
     # ---------- Helpers ----------
     def _find_device_name(self, driver_obj):
@@ -737,6 +773,38 @@ class MainWindow(QMainWindow):
             self.waterfall.set_tuned_freq(float(self.freq_spin.value()) * 1e6)
         except Exception:
             pass
+
+
+    def _open_banks_dialog(self):
+        QMessageBox.information(self, "Bancos", "Aquí irá el CRUD de bancos (siguiente paso).")
+
+    def _toggle_scanner_dock(self, checked=None):
+        if not hasattr(self, "scanner_dock"):
+            self._build_scanner_dock()
+        if checked is None:
+            checked = not self.scanner_dock.isVisible()
+        self.scanner_dock.setVisible(bool(checked))
+
+
+    def _toggle_scan(self):
+        # driver activo: usa el que ya tengas como seleccionado en tu UI
+        driver = getattr(self, "active_driver", None)
+        if driver is None:
+            QMessageBox.warning(self, "Escáner", "No hay radio/driver activo.")
+            return
+
+        if not hasattr(self, "scanner"):
+            QMessageBox.warning(self, "Escáner", "ScannerEngine no inicializado.")
+            return
+
+        if self.scanner.is_running:
+            self.scanner.stop()
+            self.btn_scan.setText("Iniciar escáner")
+            return
+
+        self.scanner.start(driver)
+        self.btn_scan.setText("Detener escáner")
+
 
 
 

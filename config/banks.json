@@ -1,0 +1,10 @@
+{
+  "freq_banks": [],
+  "range_banks": [],
+  "scan_settings": {
+    "squelch_db": -55,
+    "settle_ms": 180,
+    "hold_seconds": 5,
+    "loop": true
+  }
+}

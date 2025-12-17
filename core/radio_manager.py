@@ -65,3 +65,7 @@ class RadioManager:
 
     def update_audio_params(self, **params):
         self.audio.update_dsp_params(**params)
+
+    def set_on_audio(self, cb):
+        self.audio.set_on_audio(cb)
+
