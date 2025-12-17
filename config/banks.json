@@ -1,6 +1,43 @@
 {
-  "freq_banks": [],
-  "range_banks": [],
+  "freq_banks": [
+    {
+      "name": "EMISORAS TEST",
+      "active": false,
+      "items": [
+        {
+          "freq_mhz": 91.4,
+          "mode": "FM"
+        },
+        {
+          "freq_mhz": 102.9,
+          "mode": "FM"
+        },
+        {
+          "freq_mhz": 97.9,
+          "mode": "FM"
+        }
+      ],
+      "id": "fb_e1740d68"
+    }
+  ],
+  "range_banks": [
+    {
+      "name": "MI PRIMER ESCANEO",
+      "active": true,
+      "mode": "FM",
+      "range": {
+        "start_mhz": 98.0,
+        "stop_mhz": 108.975,
+        "ts_khz": 25.0
+      },
+      "rf_gain": {
+        "lna_db": 32,
+        "vga_db": 20,
+        "amp": false
+      },
+      "id": "rb_e8685be6"
+    }
+  ],
   "scan_settings": {
     "squelch_db": -55,
     "settle_ms": 180,

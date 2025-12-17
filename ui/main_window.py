@@ -6,7 +6,8 @@ from PySide6.QtWidgets import (
     QStatusBar, QLabel, QSplitter, QFrame, QApplication,
     QComboBox, QPushButton, QMessageBox,
     QDockWidget, QGroupBox, QFormLayout, QCheckBox,
-    QDoubleSpinBox, QSpinBox
+    QDoubleSpinBox, QSpinBox, QListWidget, QListWidgetItem, QAbstractItemView
+
 )
 from PySide6.QtCore import Qt, QTimer
 from PySide6.QtGui import QAction, QFont
@@ -20,6 +21,8 @@ from .waterfall_widget import WaterfallWidget
 from drivers.hackrf_driver import HackRFDriver
 from core.banks_store import BanksStore
 from core.scanner_engine import ScannerEngine
+from ui.banks_dialog import BanksDialog
+
 
 
 class RibbonBar(QWidget):
@@ -380,16 +383,54 @@ class MainWindow(QMainWindow):
     def _build_scanner_dock(self):
         w = QWidget()
         lay = QVBoxLayout(w)
+        lay.setContentsMargins(10, 10, 10, 10)
+        lay.setSpacing(8)
+
+        # --- Barra superior: filtro + botones ---
+        top = QHBoxLayout()
+
+        self.scan_filter = QComboBox()
+        self.scan_filter.addItems(["Todos", "Frecuencias", "Rangos"])
+        self.scan_filter.currentIndexChanged.connect(self._refresh_scanner_panel)
 
         self.btn_scan = QPushButton("Iniciar escáner")
         self.btn_scan.clicked.connect(self._toggle_scan)
 
-        lay.addWidget(self.btn_scan)
+        self.btn_scan_edit = QPushButton("Editar")
+        self.btn_scan_edit.clicked.connect(self._edit_selected_bank)
+
+        self.btn_scan_del = QPushButton("Eliminar")
+        self.btn_scan_del.clicked.connect(self._delete_selected_bank)
+
+        top.addWidget(QLabel("Mostrar:"))
+        top.addWidget(self.scan_filter, 1)
+        top.addWidget(self.btn_scan)
+        top.addWidget(self.btn_scan_edit)
+        top.addWidget(self.btn_scan_del)
+
+        lay.addLayout(top)
+
+        # --- Lista de bancos (con checkbox Activo) ---
+        self.banks_list = QListWidget()
+        self.banks_list.setSelectionMode(QAbstractItemView.SingleSelection)
+        self.banks_list.itemChanged.connect(self._on_bank_item_changed)
+        self.banks_list.itemDoubleClicked.connect(lambda _it: self._edit_selected_bank())
+        lay.addWidget(self.banks_list, 1)
+
+        # --- Estado / ayuda ---
+        self.lbl_scan_status = QLabel("Selecciona bancos activos y pulsa Iniciar.")
+        self.lbl_scan_status.setWordWrap(True)
+        lay.addWidget(self.lbl_scan_status)
 
         self.scanner_dock = QDockWidget("Escáner", self)
         self.scanner_dock.setWidget(w)
+        self.scanner_dock.setAllowedAreas(Qt.LeftDockWidgetArea | Qt.RightDockWidgetArea)
         self.addDockWidget(Qt.RightDockWidgetArea, self.scanner_dock)
         self.scanner_dock.hide()
+
+        # Cargar lista inicial
+        self._refresh_scanner_panel()
+
     
 
 
@@ -787,7 +828,7 @@ class MainWindow(QMainWindow):
 
 
     def _toggle_scan(self):
-        # driver activo: usa el que ya tengas como seleccionado en tu UI
+        # 1) Validaciones base
         driver = getattr(self, "active_driver", None)
         if driver is None:
             QMessageBox.warning(self, "Escáner", "No hay radio/driver activo.")
@@ -797,13 +838,182 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "Escáner", "ScannerEngine no inicializado.")
             return
 
-        if self.scanner.is_running:
-            self.scanner.stop()
-            self.btn_scan.setText("Iniciar escáner")
+        if not hasattr(self, "banks_store"):
+            QMessageBox.warning(self, "Escáner", "BanksStore no inicializado.")
             return
 
-        self.scanner.start(driver)
-        self.btn_scan.setText("Detener escáner")
+        # 2) Si ya está corriendo -> detener
+        if getattr(self.scanner, "is_running", False):
+            try:
+                self.scanner.stop()
+            except Exception:
+                pass
+
+            self.btn_scan.setText("Iniciar escáner")
+            if hasattr(self, "lbl_scan_status"):
+                self.lbl_scan_status.setText("Escáner detenido.")
+            if hasattr(self, "btn_scan_edit"):
+                self.btn_scan_edit.setEnabled(True)
+            if hasattr(self, "btn_scan_del"):
+                self.btn_scan_del.setEnabled(True)
+
+            # refresca lista (por si se activó/desactivó algo)
+            if hasattr(self, "_refresh_scanner_panel"):
+                self._refresh_scanner_panel()
+            return
+
+        # 3) Antes de iniciar: validar bancos activos (según filtro)
+        flt = self.scan_filter.currentText() if hasattr(self, "scan_filter") else "Todos"
+
+        freq_active = any(bool(b.get("active")) for b in self.banks_store.list_banks("freq"))
+        range_active = any(bool(b.get("active")) for b in self.banks_store.list_banks("range"))
+
+        if flt == "Frecuencias" and not freq_active:
+            QMessageBox.warning(self, "Escáner", "No hay bancos de FRECUENCIAS activos.")
+            return
+        if flt == "Rangos" and not range_active:
+            QMessageBox.warning(self, "Escáner", "No hay bancos de RANGOS activos.")
+            return
+        if flt == "Todos" and not (freq_active or range_active):
+            QMessageBox.warning(self, "Escáner", "No hay bancos activos para escanear.")
+            return
+
+        # 4) Asegurar driver conectado (si aplica)
+        try:
+            if hasattr(driver, "connect"):
+                driver.connect()
+        except Exception as e:
+            QMessageBox.warning(self, "Escáner", f"No se pudo conectar el driver:\n{e}")
+            return
+
+        # 5) Iniciar escáner
+        try:
+            # Opcional: pasar el filtro al scanner si tu ScannerEngine lo soporta
+            # Por ahora, el scanner puede leer bancos activos (freq+range)
+            self.scanner.start(driver)
+
+            self.btn_scan.setText("Detener escáner")
+            if hasattr(self, "lbl_scan_status"):
+                self.lbl_scan_status.setText("Escáner en ejecución… (Stop para finalizar)")
+            if hasattr(self, "btn_scan_edit"):
+                self.btn_scan_edit.setEnabled(False)
+            if hasattr(self, "btn_scan_del"):
+                self.btn_scan_del.setEnabled(False)
+
+        except Exception as e:
+            QMessageBox.warning(self, "Escáner", f"No se pudo iniciar:\n{e}")
+            self.btn_scan.setText("Iniciar escáner")
+            if hasattr(self, "lbl_scan_status"):
+                self.lbl_scan_status.setText("Error iniciando escáner.")
+            if hasattr(self, "btn_scan_edit"):
+                self.btn_scan_edit.setEnabled(True)
+            if hasattr(self, "btn_scan_del"):
+                self.btn_scan_del.setEnabled(True)
+
+    
+    def _open_banks_dialog(self):
+        try:
+            dlg = BanksDialog(self, self.banks_store)
+            dlg.exec()
+            # opcional: refrescar panel del escáner si ya lo tienes
+            if hasattr(self, "_refresh_scanner_panel"):
+                self._refresh_scanner_panel()
+        except Exception as e:
+            QMessageBox.warning(self, "Bancos", f"No se pudo abrir el administrador:\n{e}")
+
+    def _refresh_scanner_panel(self):
+        if not hasattr(self, "banks_store"):
+            return
+
+        # Evitar disparar itemChanged mientras reconstruimos
+        self.banks_list.blockSignals(True)
+        self.banks_list.clear()
+
+        flt = self.scan_filter.currentText()
+
+        def add_bank(kind: str, b: dict):
+            name = b.get("name", "")
+            active = bool(b.get("active", False))
+
+            if kind == "freq":
+                items = b.get("items") or []
+                modes = sorted({(it.get("mode") or "").upper().strip() for it in items if it.get("mode")})
+                meta = f"{len(items)} frec | {', '.join(modes) if modes else '-'}"
+                tag = "FREQ"
+            else:
+                r = b.get("range") or {}
+                meta = f"{r.get('start_mhz','?')}–{r.get('stop_mhz','?')} MHz | TS {r.get('ts_khz','?')} kHz | {str(b.get('mode','')).upper()}"
+                tag = "RANGE"
+
+            it = QListWidgetItem(f"[{tag}] {name}  —  {meta}")
+            it.setFlags(it.flags() | Qt.ItemIsUserCheckable | Qt.ItemIsSelectable | Qt.ItemIsEnabled)
+            it.setCheckState(Qt.Checked if active else Qt.Unchecked)
+
+            # guardamos kind y id en UserRole
+            it.setData(Qt.UserRole, (kind, b.get("id")))
+            self.banks_list.addItem(it)
+
+        if flt in ("Todos", "Frecuencias"):
+            for b in self.banks_store.list_banks("freq"):
+                add_bank("freq", b)
+
+        if flt in ("Todos", "Rangos"):
+            for b in self.banks_store.list_banks("range"):
+                add_bank("range", b)
+
+        self.banks_list.blockSignals(False)
+
+
+
+    def _on_bank_item_changed(self, item: QListWidgetItem):
+        data = item.data(Qt.UserRole)
+        if not data:
+            return
+        kind, bank_id = data
+        active = (item.checkState() == Qt.Checked)
+        try:
+            self.banks_store.set_active(kind, bank_id, active)
+        except Exception as e:
+            QMessageBox.warning(self, "Bancos", f"No se pudo cambiar activo:\n{e}")
+        # no recargamos toda la lista para no perder selección
+
+
+    def _selected_bank(self):
+        it = self.banks_list.currentItem()
+        if not it:
+            return None, None
+        data = it.data(Qt.UserRole)
+        if not data:
+            return None, None
+        return data  # (kind, id)
+
+
+    def _edit_selected_bank(self):
+        kind, bank_id = self._selected_bank()
+        if not bank_id:
+            QMessageBox.information(self, "Editar", "Selecciona un banco.")
+            return
+        # Abre el administrador general
+        self._open_banks_dialog()
+        self._refresh_scanner_panel()
+
+
+    def _delete_selected_bank(self):
+        kind, bank_id = self._selected_bank()
+        if not bank_id:
+            QMessageBox.information(self, "Eliminar", "Selecciona un banco.")
+            return
+
+        if QMessageBox.question(self, "Confirmar", "¿Eliminar este banco?") != QMessageBox.Yes:
+            return
+
+        try:
+            self.banks_store.delete_bank(kind, bank_id)
+            self._refresh_scanner_panel()
+        except Exception as e:
+            QMessageBox.warning(self, "Eliminar", str(e))
+
+
 
 
 
