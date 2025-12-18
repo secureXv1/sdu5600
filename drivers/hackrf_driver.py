@@ -103,7 +103,6 @@ class IQRingBuffer:
         self.lock = threading.Lock()
 
     def push_iq_int8(self, data_i8: np.ndarray):
-        # data_i8: int8 intercalado I,Q,I,Q...
         if data_i8.size < 2:
             return
         if data_i8.size % 2:
@@ -112,9 +111,10 @@ class IQRingBuffer:
         i = data_i8[0::2].astype(np.float32, copy=False)
         q = data_i8[1::2].astype(np.float32, copy=False)
         iq = (i + 1j * q) / 128.0
-        self.push(iq.astype(np.complex64, copy=False))
-        iq = (i + 1j*q) / 128.0
-        iq = iq - np.mean(iq)   # <- importante para FM
+
+        # DC removal (muy importante para FM/NFM)
+        iq = iq - np.mean(iq)
+
         self.push(iq.astype(np.complex64, copy=False))
 
 

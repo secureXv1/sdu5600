@@ -42,6 +42,30 @@ def deemph(x: np.ndarray, fs: int, tau: float, state: float):
     return y, s
 
 
+def hpf_1pole(x: np.ndarray, fs: int, cutoff_hz: float, state_x: float, state_y: float):
+    """
+    HPF 1er orden: y[n] = a*(y[n-1] + x[n] - x[n-1])
+    Retorna (y, new_state_x, new_state_y)
+    """
+    if cutoff_hz <= 0:
+        return x.astype(np.float32, copy=False), float(state_x), float(state_y)
+
+    dt = 1.0 / float(fs)
+    rc = 1.0 / (2.0 * np.pi * float(cutoff_hz))
+    a = rc / (rc + dt)
+
+    y = np.empty_like(x, dtype=np.float32)
+    px = float(state_x)
+    py = float(state_y)
+    for i, xx in enumerate(x):
+        xx = float(xx)
+        py = a * (py + xx - px)
+        y[i] = py
+        px = xx
+    return y, px, py
+
+
+
 def iq_from_int8_bytes(data: bytes) -> np.ndarray:
     a = np.frombuffer(data, dtype=np.int8)
     if a.size < 4:
@@ -99,6 +123,10 @@ class WBFMStream:
         self.on_audio = on_audio  # callback opcional para grabación
         self._stop_evt = threading.Event()
 
+                # ---- Params en vivo (tuneables) ----
+        self.hpf_hz = 0.0  # 0=off, NFM típico 300 Hz
+        self.hpf_x1 = 0.0
+        self.hpf_y1 = 0.0
 
 
 
@@ -138,8 +166,11 @@ class WBFMStream:
                 self.chan_taps = int(chan_taps)
             if aud_taps is not None:
                 self.aud_taps = int(aud_taps)
-
+            if hpf_hz is not None:
+                self.hpf_hz = float(hpf_hz)
             self._rebuild_filters()
+
+            
     def start(self):
         if self._running:
             return
@@ -206,6 +237,18 @@ class WBFMStream:
                 with self._param_lock:
                     drive = float(self.drive)
                 audio = np.tanh(audio * drive).astype(np.float32)
+
+                audio, self.de_state = deemph(audio, self.audio_fs, self.tau, self.de_state)
+
+                with self._param_lock:
+                    drive = float(self.drive)
+                    hpf = float(self.hpf_hz)
+
+                audio, self.hpf_x1, self.hpf_y1 = hpf_1pole(audio, self.audio_fs, hpf, self.hpf_x1, self.hpf_y1)
+
+                audio = np.tanh(audio * drive).astype(np.float32)
+
+
 
                 try:
                     self.audio_q.put_nowait(audio)

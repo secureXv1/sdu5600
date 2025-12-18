@@ -6,6 +6,8 @@ from typing import Callable, Optional
 
 from core.dsp.wbfm import WBFMStream
 from core.dsp.nbfm import NBFMStream
+from core.dsp.am import AMStream
+from core.dsp.ssb import SSBStream
 
 
 class AudioEngine:
@@ -55,36 +57,90 @@ class AudioEngine:
         q = driver.get_audio_queue()
 
         mode = (mode or "").upper().strip()
-        if mode in ("FM", "WFM"):  # WFM = FM comercial
+
+        # Sample rate de entrada (importante para AM/SSB si resamplean)
+        input_fs = int(getattr(driver, "sample_rate", 2_400_000))
+
+        # ---- Presets "voz limpia" (tipo SDR Console) ----
+        # OJO: esto se aplica primero, pero luego pending_params (UI) tiene prioridad.
+        preset = {}
+        if mode in ("NFM", "FMN"):
+            preset = dict(
+                chan_cutoff_hz=16_000.0,  # IF NFM
+                aud_cutoff_hz=3_000.0,    # AF voz
+                tau_us=530.0,             # de-emphasis NFM
+                drive=1.0,
+                hpf_hz=300.0              # limpia graves
+            )
+        elif mode in ("AM",):
+            preset = dict(
+                drive=1.2,
+                hpf_hz=150.0,             # limpia graves
+                # aud_cutoff_hz lo maneja AMStream internamente como LPF (3k por defecto)
+            )
+        elif mode in ("USB", "LSB"):
+            preset = dict(
+                drive=1.2,
+                hpf_hz=150.0,             # limpia graves
+                # LPF voz 3k por defecto en SSBStream
+            )
+        else:
+            # FM broadcast (si lo usas para voz, no recomiendo; pero lo dejamos neutro)
+            preset = dict(
+                drive=1.1,
+                hpf_hz=0.0
+            )
+
+        # ---- Selección de stream ----
+        if mode in ("FM", "WFM"):
             self.stream = WBFMStream(iq_bytes_queue=q, freq_mhz=freq_mhz, on_audio=self._on_audio)
-        elif mode == "NFM":
+
+        elif mode in ("NFM", "FMN"):
             self.stream = NBFMStream(iq_bytes_queue=q, freq_mhz=freq_mhz, on_audio=self._on_audio)
+
+        elif mode == "AM":
+            # requiere core/dsp/am.py (AMStream)
+            from core.dsp.am import AMStream
+            self.stream = AMStream(iq_bytes_queue=q, freq_mhz=freq_mhz, on_audio=self._on_audio, input_fs=input_fs)
+
+        elif mode in ("USB", "LSB"):
+            # requiere core/dsp/ssb.py (SSBStream)
+            from core.dsp.ssb import SSBStream
+            self.stream = SSBStream(iq_bytes_queue=q, freq_mhz=freq_mhz, sideband=mode, on_audio=self._on_audio, input_fs=input_fs)
+
         else:
             raise ValueError(f"Modo no soportado: {mode}")
 
-        # aplica parámetros pendientes (si el UI los envió antes de iniciar)
-        if self.pending_params and hasattr(self.stream, "update_params"):
+        # ---- Aplicación de params: preset primero, UI después (UI manda) ----
+        if hasattr(self.stream, "update_params"):
             try:
-                self.stream.update_params(**self.pending_params)
+                if preset:
+                    self.stream.update_params(**preset)
             except Exception:
                 pass
 
+            # aplica parámetros pendientes (si el UI los envió antes de iniciar)
+            if self.pending_params:
+                try:
+                    self.stream.update_params(**self.pending_params)
+                except Exception:
+                    pass
+
+        # ---- Arranque ----
         if blocking:
-            # modo antiguo: bloquea aquí (no recomendado para scan)
             self.stream.start()
             return
 
-        # modo recomendado para scan: no bloquear
         def _run():
             try:
                 self.stream.start()
             except Exception:
-                # si falla, liberamos referencia
                 with self._lock:
                     self.stream = None
 
         self._thread = threading.Thread(target=_run, daemon=True)
         self._thread.start()
+
 
     def stop(self):
         with self._lock:

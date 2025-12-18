@@ -364,8 +364,11 @@ class MainWindow(QMainWindow):
         le.editingFinished.connect(self._apply_tune)
 
         self.mode_combo = QComboBox()
-        self.mode_combo.addItems(["FM", "NFM"])
+        self.mode_combo.addItems(["NFM", "AM", "USB", "LSB", "FM"])
         self.mode_combo.setMinimumHeight(38)
+        self.mode_combo.currentTextChanged.connect(self._apply_mode_preset)
+
+       
 
         self.btn_monitor = QPushButton("▶ MONITOR")
         self.btn_monitor.setMinimumHeight(44)
@@ -446,7 +449,54 @@ class MainWindow(QMainWindow):
         # Cargar lista inicial
         self._refresh_scanner_panel()
 
-    
+    def _apply_mode_preset(self, mode: str):
+        mode = (mode or "").upper().strip()
+
+        # Solo si existe el dock
+        if not hasattr(self, "dsp_tau"):
+            return
+
+        # Defaults “voz limpia”
+        if mode in ("NFM", "FMN"):
+            # NFM: IF 16k, AF 3k, HPF 300, tau 530
+            self.dsp_chan_cut.setValue(16_000.0)
+            self.dsp_aud_cut.setValue(3_000.0)
+            self.dsp_tau.setValue(530.0)     # us
+            self.dsp_drive.setValue(1.0)
+            if hasattr(self, "dsp_hpf"):
+                self.dsp_hpf.setValue(300.0)
+
+        elif mode == "AM":
+            # AM: (no tau) AF 3k, HPF 150
+            # OJO: tu dock etiqueta “FM Canal cutoff”, pero lo usamos como “canal/IF” genérico
+            self.dsp_chan_cut.setValue(10_000.0)   # AM voz típica 6–10k
+            self.dsp_aud_cut.setValue(3_000.0)
+            self.dsp_tau.setValue(1.0)             # “sin tau” (mínimo) para no afectar
+            self.dsp_drive.setValue(1.2)
+            if hasattr(self, "dsp_hpf"):
+                self.dsp_hpf.setValue(150.0)
+
+        elif mode in ("USB", "LSB"):
+            # SSB: (no tau) AF 3k, HPF 150
+            self.dsp_chan_cut.setValue(3_000.0)    # ancho SSB típico 2.4–3k
+            self.dsp_aud_cut.setValue(3_000.0)
+            self.dsp_tau.setValue(1.0)             # “sin tau”
+            self.dsp_drive.setValue(1.2)
+            if hasattr(self, "dsp_hpf"):
+                self.dsp_hpf.setValue(150.0)
+
+        else:  # FM (broadcast)
+            self.dsp_chan_cut.setValue(110_000.0)
+            self.dsp_aud_cut.setValue(15_000.0)
+            self.dsp_tau.setValue(50.0)            # Colombia: 50us
+            self.dsp_drive.setValue(1.2)
+            if hasattr(self, "dsp_hpf"):
+                self.dsp_hpf.setValue(0.0)
+
+        # Auto-aplicar al motor (igual que SDR Console)
+        self._apply_audio_dsp_params()
+
+
 
 
 
@@ -510,6 +560,13 @@ class MainWindow(QMainWindow):
         self.audio_dsp_dock.setAllowedAreas(Qt.LeftDockWidgetArea | Qt.RightDockWidgetArea)
         self.addDockWidget(Qt.RightDockWidgetArea, self.audio_dsp_dock)
         self.audio_dsp_dock.hide()
+        self.dsp_hpf = QDoubleSpinBox()
+        self.dsp_hpf.setRange(0.0, 2000.0)
+        self.dsp_hpf.setSingleStep(50.0)
+        self.dsp_hpf.setValue(0.0)
+
+        f.addRow("Audio HPF (Hz)", self.dsp_hpf)
+
 
 
     def _apply_audio_dsp_params(self):
@@ -700,6 +757,7 @@ class MainWindow(QMainWindow):
             aud_cutoff_hz=float(self.dsp_aud_cut.value()),
             tau_us=float(self.dsp_tau.value()),
             drive=float(self.dsp_drive.value()),
+            hpf_hz=float(self.dsp_hpf.value()) if hasattr(self, "dsp_hpf") else 0.0,
             chan_taps=int(self.dsp_chan_taps.value()) if hasattr(self, "dsp_chan_taps") else 161,
             aud_taps=int(self.dsp_aud_taps.value()) if hasattr(self, "dsp_aud_taps") else 161,
         )
