@@ -1,8 +1,8 @@
 from __future__ import annotations
 
-import re
 import time
 import threading
+import re
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -31,9 +31,9 @@ def fmt_freq_mhz(mhz: float) -> str:
 
 @dataclass
 class ScanStatus:
-    bank_kind: str        # "range" | "freq"
+    bank_kind: str      # "range" | "freq"
     bank_name: str
-    state: str            # "SCAN" | "HOLD" | "IDLE"
+    state: str          # "SCAN" | "HOLD" | "IDLE"
     freq_mhz: float
     level_db: float
 
@@ -45,19 +45,20 @@ class ScannerEngine:
 
         self._t: Optional[threading.Thread] = None
         self._stop_evt = threading.Event()
-        self.is_running: bool = False
+        self.is_running = False
 
+        # grabación (ICR clip fijo)
         self._rec: Optional[WavRecorder] = None
-        self._rec_freq_mhz: Optional[float] = None
-        self._last_above_ts: float = 0.0
-
-        self._on_status: Optional[Callable[[ScanStatus], None]] = None
         self._rec_done = threading.Event()
         self._armed = False
-        self._armed_path = None
+        self._armed_path: Optional[Path] = None
         self._armed_until = 0.0
 
+        self._on_status: Optional[Callable[[ScanStatus], None]] = None
+        self.driver = None
+        self.kind_filter = "ALL"
 
+    # ---------- API ----------
     def start(self, driver, kind_filter: str = "ALL", on_status: Optional[Callable[[ScanStatus], None]] = None):
         if self.is_running:
             return
@@ -67,6 +68,8 @@ class ScannerEngine:
 
         self._stop_evt.clear()
         self.is_running = True
+        self.manager.set_on_audio(self._on_audio)
+
         self._t = threading.Thread(target=self._loop, daemon=True)
         self._t.start()
 
@@ -79,7 +82,6 @@ class ScannerEngine:
             self.manager.stop_audio()
         except Exception:
             pass
-
         try:
             self.manager.set_on_audio(None)
         except Exception:
@@ -92,107 +94,7 @@ class ScannerEngine:
             pass
         self._t = None
 
-    def _on_audio(self, audio_float32):
-        # Si no estamos grabando ni armados -> nada
-        if self._rec is None and not self._armed:
-            return
-
-        now = time.time()
-
-        # Si estamos armados pero aún no abrimos archivo, lo abrimos al primer audio real
-        if self._rec is None and self._armed:
-            try:
-                self._rec = WavRecorder(str(self._armed_path), sample_rate=48000)
-                self._rec.start()
-            except Exception:
-                self._armed = False
-                self._armed_path = None
-                self._rec = None
-                self._rec_done.set()
-                return
-
-        # Escribimos audio
-        try:
-            self._rec.write_float32(audio_float32)
-        except Exception:
-            self._stop_recording()
-            self._rec_done.set()
-            return
-
-        # ¿Se cumplió el tiempo fijo? (ICR-style: clip fijo y seguimos)
-        if now >= self._armed_until:
-            self._stop_recording()
-            self._rec_done.set()
-
-
-    def _arm_recording(self, folder: Path, fname: str, hold_seconds: int):
-        # NO crear archivo aún: lo creamos cuando llegue el primer audio (evita wav vacío)
-        self._stop_recording()
-        folder.mkdir(parents=True, exist_ok=True)
-
-        self._armed = True
-        self._armed_path = (folder / fname)
-        self._armed_until = time.time() + float(hold_seconds)
-        self._rec_done.clear()
-
-
-    def _stop_recording(self):
-        # limpiar armado
-        self._armed = False
-        self._armed_path = None
-        self._armed_until = 0.0
-
-        if self._rec:
-            try:
-                self._rec.stop()
-            except Exception:
-                pass
-        self._rec = None
-
-    def _active_range_banks(self):
-        return [b for b in self.store.list_banks("range") if b.get("active")]
-
-    def _active_freq_banks(self):
-        return [b for b in self.store.list_banks("freq") if b.get("active")]
-
-    def _level_db(self, tuned_hz: float) -> float:
-        # 1) Smeter si existe
-        try:
-            if hasattr(self.driver, "get_smeter"):
-                return float(self.driver.get_smeter())
-        except Exception:
-            pass
-
-        # 2) Espectro: peak cerca de la frecuencia sintonizada (evita disparos por ruido lejano)
-        if hasattr(self.driver, "get_spectrum"):
-            try:
-                freqs, levels = self.driver.get_spectrum()
-                if freqs is None or levels is None or len(freqs) == 0:
-                    return -999.0
-                try:
-                    import numpy as np
-                    freqs_np = np.asarray(freqs, dtype=float)
-                    levels_np = np.asarray(levels, dtype=float)
-                    f0 = float(tuned_hz)
-                    idx = int(np.argmin(np.abs(freqs_np - f0)))
-
-                    bw = 12_500.0  # +/- 12.5 kHz
-                    if len(freqs_np) >= 2:
-                        df = abs(freqs_np[1] - freqs_np[0])
-                        n = max(2, int(bw / df))
-                    else:
-                        n = 8
-
-                    lo = max(0, idx - n)
-                    hi = min(len(levels_np), idx + n + 1)
-                    return float(levels_np[lo:hi].max())
-                except Exception:
-                    return float(max(levels))
-            except Exception:
-                return -999.0
-
-        return -999.0
-
+    # ---------- status ----------
     def _emit_status(self, bank_kind: str, bank_name: str, state: str, freq_mhz: float, level_db: float):
         cb = self._on_status
         if cb is None:
@@ -208,14 +110,107 @@ class ScannerEngine:
         except Exception:
             pass
 
+    # ---------- grabación ----------
+    def _arm_recording(self, folder: Path, fname: str, hold_seconds: int):
+        self._stop_recording()
+        folder.mkdir(parents=True, exist_ok=True)
+
+        self._armed = True
+        self._armed_path = folder / fname
+        self._armed_until = time.time() + float(hold_seconds)
+        self._rec_done.clear()
+
+    def _stop_recording(self):
+        self._armed = False
+        self._armed_path = None
+        self._armed_until = 0.0
+
+        if self._rec:
+            try:
+                self._rec.stop()
+            except Exception:
+                pass
+        self._rec = None
+
+    def _on_audio(self, audio_float32):
+        # si no estamos armados / grabando, no hacemos nada
+        if self._rec is None and not self._armed:
+            return
+
+        now = time.time()
+
+        # crea WAV SOLO al primer audio real (evita archivos vacíos)
+        if self._rec is None and self._armed:
+            try:
+                self._rec = WavRecorder(str(self._armed_path), sample_rate=48_000)
+                self._rec.start()
+            except Exception:
+                self._stop_recording()
+                self._rec_done.set()
+                return
+
+        # escribe audio
+        try:
+            self._rec.write_float32(audio_float32)
+        except Exception:
+            self._stop_recording()
+            self._rec_done.set()
+            return
+
+        # termina clip fijo
+        if now >= self._armed_until:
+            self._stop_recording()
+            self._rec_done.set()
+
+    # ---------- nivel (squelch) ----------
+    def _level_db(self, tuned_hz: float) -> float:
+        # Smeter si existe
+        try:
+            if hasattr(self.driver, "get_smeter"):
+                return float(self.driver.get_smeter())
+        except Exception:
+            pass
+
+        # Peak cerca de la frecuencia sintonizada (evita disparos por ruido lejano)
+        if hasattr(self.driver, "get_spectrum"):
+            try:
+                freqs, levels = self.driver.get_spectrum()
+                if freqs is None or levels is None or len(freqs) == 0:
+                    return -999.0
+
+                import numpy as np
+                freqs_np = np.asarray(freqs, dtype=float)
+                levels_np = np.asarray(levels, dtype=float)
+
+                f0 = float(tuned_hz)
+                idx = int(np.argmin(np.abs(freqs_np - f0)))
+
+                bw = 12_500.0  # +/- 12.5 kHz
+                df = abs(freqs_np[1] - freqs_np[0]) if len(freqs_np) >= 2 else 1.0
+                n = max(2, int(bw / max(df, 1.0)))
+
+                lo = max(0, idx - n)
+                hi = min(len(levels_np), idx + n + 1)
+                return float(levels_np[lo:hi].max())
+            except Exception:
+                return -999.0
+
+        return -999.0
+
+    # ---------- bancos ----------
+    def _active_range_banks(self):
+        return [b for b in self.store.list_banks("range") if b.get("active")]
+
+    def _active_freq_banks(self):
+        return [b for b in self.store.list_banks("freq") if b.get("active")]
+
+    # ---------- loop ----------
     def _loop(self):
         s = self.store.settings()
         squelch_db = float(s["squelch_db"])
         settle_s = float(s["settle_ms"]) / 1000.0
-        hold_s = float(max(0, int(s["hold_seconds"])))  # hold_seconds = duración del clip
+        hold_s = float(max(1, int(s["hold_seconds"])))  # clip fijo en segundos
         loop_forever = bool(s["loop"])
-
-        self.manager.set_on_audio(self._on_audio)
 
         session_ts = ts_name(datetime.now())
 
@@ -223,13 +218,13 @@ class ScannerEngine:
             while not self._stop_evt.is_set():
                 did_any = False
 
-                banks_range = self._active_range_banks() if self.kind_filter in ("ALL", "RANGE") else []
-                banks_freq  = self._active_freq_banks()  if self.kind_filter in ("ALL", "FREQ")  else []
+                banks_range = self._active_range_banks() if self.kind_filter in ("ALL","RANGE") else []
+                banks_freq  = self._active_freq_banks()  if self.kind_filter in ("ALL","FREQ")  else []
 
                 if not banks_range and not banks_freq:
                     break
 
-                # ---- FRECUENCIAS ----
+                # --- FRECUENCIAS ---
                 for bank in banks_freq:
                     if self._stop_evt.is_set():
                         break
@@ -245,7 +240,7 @@ class ScannerEngine:
                         mode = (it.get("mode") or "NFM").upper().strip()
                         self._scan_single_freq("freq", bank_name, bank_folder, f, mode, squelch_db, settle_s, hold_s)
 
-                # ---- RANGOS ----
+                # --- RANGOS ---
                 for bank in banks_range:
                     if self._stop_evt.is_set():
                         break
@@ -258,17 +253,6 @@ class ScannerEngine:
                     start = float(r["start_mhz"])
                     stop = float(r["stop_mhz"])
                     step_mhz = float(r["ts_khz"]) / 1000.0
-
-                    rg = bank.get("rf_gain") or {}
-                    if hasattr(self.driver, "set_rf_gain"):
-                        try:
-                            self.driver.set_rf_gain(
-                                lna_db=int(rg.get("lna_db", 32)),
-                                vga_db=int(rg.get("vga_db", 20)),
-                                amp=bool(rg.get("amp", False)),
-                            )
-                        except Exception:
-                            pass
 
                     f = start
                     while f <= stop and not self._stop_evt.is_set():
@@ -307,24 +291,28 @@ class ScannerEngine:
             except Exception:
                 return
 
-        # deja estabilizar (muy importante para RSSI)
+        # UI: “voy por aquí”
+        self._emit_status(bank_kind, bank_name, "SCAN", f, -999.0)
+
+        # estabiliza
         if settle_s > 0:
             time.sleep(settle_s)
 
+        # nivel
         level = self._level_db(tuned_hz=f * 1e6)
         self._emit_status(bank_kind, bank_name, "SCAN", f, level)
 
-        # ¿supera squelch? => capturar clip fijo (ICR-style)
+        # si no supera squelch, sigue
         if level < squelch_db:
             return
 
-        # nombre del archivo: 17DIC25_14-48_98.275_FM.wav
+        # nombre del clip
         dt = datetime.now()
         ts = ts_name(dt)
         fstr = fmt_freq_mhz(f)
         fname = f"{ts}_{fstr}_{mode}.wav"
 
-        # arma grabación (NO crea wav hasta que llegue audio real)
+        # arma grabación (sin wav vacío)
         self._arm_recording(bank_folder, fname, hold_seconds=int(hold_s))
 
         # inicia audio
@@ -334,22 +322,21 @@ class ScannerEngine:
             self._stop_recording()
             return
 
-        # espera a que termine el clip o el usuario detenga
-        t0 = time.time()
+        # HOLD fijo: espera a que termine clip o usuario detenga
         self._emit_status(bank_kind, bank_name, "HOLD", f, level)
+        t0 = time.time()
 
         while not self._stop_evt.is_set():
             if self._rec_done.is_set():
                 break
 
-            # si en 0.8s no llegó audio -> aborta sin wav vacío
+            # si no llegó audio en 0.8s, aborta (no wav vacío)
             if self._rec is None and self._armed and (time.time() - t0) > 0.8:
                 self._stop_recording()
                 break
 
             time.sleep(0.03)
 
-        # detener audio para seguir escaneo limpio
         try:
             self.manager.stop_audio()
         except Exception:

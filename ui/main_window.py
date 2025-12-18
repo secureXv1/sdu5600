@@ -118,23 +118,6 @@ class SpectrumWidget(QWidget):
             pass
 
     def set_tuned_freq_mhz(self, mhz: float):
-        self.tune_line.setPos(float(mhz))
-
-    def center_on_mhz(self, mhz: float):
-        """
-        Mueve la ventana visible del espectro (XRange) para que el centro sea 'mhz'.
-        Mantiene el mismo ancho de span que el usuario esté viendo.
-        """
-        try:
-            (x0, x1), (_y0, _y1) = self.plot.viewRange()
-            width = max(0.001, float(x1) - float(x0))  # evita width 0
-            c = float(mhz)
-            self.plot.setXRange(c - width/2.0, c + width/2.0, padding=0.0)
-        except Exception:
-            pass
-
-
-    def set_tuned_freq_mhz(self, mhz: float):
         try:
             self.tune_line.setPos(float(mhz))
             self.tune_line.show()
@@ -149,6 +132,7 @@ class SpectrumWidget(QWidget):
             self.plot.setXRange(c - width/2.0, c + width/2.0, padding=0.0)
         except Exception:
             pass
+
 
 
 
@@ -813,9 +797,28 @@ class MainWindow(QMainWindow):
             return
 
         # Spectrum
-        tuned_mhz = float(self.freq_spin.value())
+        # Spectrum: cuando escanea, el "tuned" debe seguir el centro real del FFT
+        if getattr(self, "scanner", None) is not None and getattr(self.scanner, "is_running", False):
+            try:
+                center_hz = (float(freqs[0]) + float(freqs[-1])) / 2.0
+                tuned_mhz = center_hz / 1e6
+            except Exception:
+                tuned_mhz = float(self.freq_spin.value())
+
+            # Actualiza el dial SI el usuario no lo está editando
+            try:
+                if not self.freq_spin.hasFocus() and not self.freq_spin.lineEdit().hasFocus():
+                    self.freq_spin.blockSignals(True)
+                    self.freq_spin.setValue(float(tuned_mhz))
+                    self.freq_spin.blockSignals(False)
+            except Exception:
+                pass
+        else:
+            tuned_mhz = float(self.freq_spin.value())
+
         self.spectrum.update_spectrum(freqs, levels, tuned_mhz=tuned_mhz)
         self.spectrum.set_tuned_freq_mhz(tuned_mhz)
+
 
 
         # Waterfall (vertical: apila líneas, no “desplaza x”)
@@ -842,7 +845,8 @@ class MainWindow(QMainWindow):
         # Rango real del FFT para eje X del waterfall
         try:
             self.waterfall.set_freq_axis(freqs[0], freqs[-1])
-            self.waterfall.set_tuned_freq(float(self.freq_spin.value()) * 1e6)
+            self.waterfall.set_tuned_freq(float(tuned_mhz) * 1e6)
+
         except Exception:
             pass
 
@@ -892,35 +896,8 @@ class MainWindow(QMainWindow):
         except Exception:
             pass
 
-    def _scan_status_from_thread(self, st):
-        # hilo del scanner -> hilo UI
-        try:
-            QTimer.singleShot(0, lambda s=st: self._apply_scan_status(s))
-        except Exception:
-            pass
 
-    def _apply_scan_status(self, st):
-        try:
-            # Dial
-            self.freq_spin.blockSignals(True)
-            self.freq_spin.setValue(float(st.freq_mhz))
-            self.freq_spin.blockSignals(False)
-
-            # Línea verde + centrar espectro
-            if hasattr(self, "spectrum"):
-                self.spectrum.set_tuned_freq_mhz(float(st.freq_mhz))
-                if hasattr(self.spectrum, "center_on_mhz"):
-                    self.spectrum.center_on_mhz(float(st.freq_mhz))
-
-            # Estado
-            if hasattr(self, "lbl_scan_status"):
-                self.lbl_scan_status.setText(
-                    f"{st.state} · [{st.bank_kind.upper()}] {st.bank_name} · {st.freq_mhz:.6f} MHz · {st.level_db:.1f} dB"
-                )
-        except Exception:
-            pass
-
-
+  
 
 
     def _toggle_scan(self):
@@ -992,10 +969,12 @@ class MainWindow(QMainWindow):
                 "Rangos": "RANGE",
             }.get(flt, "ALL")
 
+          
             flt = self.scan_filter.currentText() if hasattr(self, "scan_filter") else "Todos"
             kind = {"Todos": "ALL", "Frecuencias": "FREQ", "Rangos": "RANGE"}.get(flt, "ALL")
 
             self.scanner.start(driver, kind_filter=kind, on_status=self._scan_status_from_thread)
+
 
 
 

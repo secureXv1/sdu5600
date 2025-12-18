@@ -11,7 +11,8 @@ from PySide6.QtWidgets import (
 )
 from PySide6.QtCore import Qt, QTimer
 
-from core.scan_engine import ScanEngine, ScanConfig
+from core.scanner_engine import ScannerEngine
+
 
 
 class RadioCard(QWidget):
