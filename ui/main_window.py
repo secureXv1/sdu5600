@@ -10,10 +10,15 @@ from PySide6.QtWidgets import (
 
 )
 from PySide6.QtCore import Qt, QTimer
-from PySide6.QtGui import QAction, QFont
+from PySide6.QtGui import QAction, QFont, QCursor
 
 import pyqtgraph as pg
 import threading
+import re
+import math
+from PySide6.QtWidgets import QToolButton, QMenu, QSlider
+from PySide6.QtCore import QEvent
+
 
 from core.radio_manager import RadioManager
 from .radio_card import RadioCard
@@ -52,7 +57,16 @@ class RibbonBar(QWidget):
 
 
 class SpectrumWidget(QWidget):
-    """Display de espectro principal (FFT)."""
+    """Display de espectro principal (FFT) estilo SDR."""
+    MODE_BW_HZ = {
+        "NFM": 12_500,
+        "FMN": 12_500,
+        "AM": 10_000,
+        "USB": 2_700,
+        "LSB": 2_700,
+        "FM": 200_000,
+    }
+
     def __init__(self, parent=None):
         super().__init__(parent)
         v = QVBoxLayout(self)
@@ -60,7 +74,7 @@ class SpectrumWidget(QWidget):
 
         self.plot = pg.PlotWidget()
         self.plot.setBackground("#020617")
-        self.plot.showGrid(x=True, y=True, alpha=0.2)
+        self.plot.showGrid(x=True, y=True, alpha=0.15)
 
         self.plot.setLabel("bottom", "Frecuencia", units="MHz")
         self.plot.setLabel("left", "Nivel", units="dB")
@@ -68,20 +82,65 @@ class SpectrumWidget(QWidget):
         self.plot.enableAutoRange(x=False, y=False)
         self.plot.setYRange(-140, 0, padding=0.0)
 
-        self.curve = self.plot.plot([], [], pen=pg.mkPen("#f9fafb", width=1.2))
+        # Curva + relleno (tipo SDR)
+        self.curve = self.plot.plot([], [], pen=pg.mkPen("#e5e7eb", width=1.2))
+        self.curve.setFillLevel(-140)
+        self.curve.setBrush(pg.mkBrush(255, 255, 255, 35))
 
-        self.tune_line = pg.InfiniteLine(
-            angle=90, movable=False,
-            pen=pg.mkPen("#22c55e", width=2.4)
+        # --- Marcador “canal” (3 líneas + banda sombreada) ---
+        self._tuned_mhz = None
+        self._mode = "NFM"
+
+        # Banda sombreada (centro +- BW/2)
+        self.chan_region = pg.LinearRegionItem(
+            values=[0.0, 0.0],
+            movable=False,
+            brush=pg.mkBrush(34, 197, 94, 35),
+            pen=pg.mkPen(34, 197, 94, 90, width=1),
         )
-        self.plot.addItem(self.tune_line)
+        self.plot.addItem(self.chan_region)
 
-        # Overlay texto (arriba del espectro)
+        # Líneas: izquierda, centro, derecha
+        self.tune_left = pg.InfiniteLine(angle=90, movable=False, pen=pg.mkPen("#22c55e", width=1.6))
+        self.tune_center = pg.InfiniteLine(angle=90, movable=False, pen=pg.mkPen("#22c55e", width=2.6))
+        self.tune_right = pg.InfiniteLine(angle=90, movable=False, pen=pg.mkPen("#22c55e", width=1.6))
+        self.plot.addItem(self.tune_left)
+        self.plot.addItem(self.tune_center)
+        self.plot.addItem(self.tune_right)
+
+        # Overlay texto arriba
         self._info = pg.TextItem(color="#e5e7eb", anchor=(0, 0))
-        self._info.setPos(0, 0)  # se reajusta con viewRange
         self.plot.addItem(self._info)
 
         v.addWidget(self.plot)
+
+    def set_mode(self, mode: str):
+        self._mode = (mode or "").upper().strip() or "NFM"
+        self._refresh_channel_marker()
+
+    def _bw_mhz(self) -> float:
+        bw_hz = self.MODE_BW_HZ.get(self._mode, 12_500)
+        return float(bw_hz) / 1e6
+
+    def _refresh_channel_marker(self):
+        if self._tuned_mhz is None:
+            return
+        bw = self._bw_mhz()
+        c = float(self._tuned_mhz)
+        left = c - (bw / 2.0)
+        right = c + (bw / 2.0)
+
+        try:
+            self.chan_region.setRegion((left, right))
+            self.tune_left.setPos(left)
+            self.tune_center.setPos(c)
+            self.tune_right.setPos(right)
+            self.chan_region.show()
+            self.tune_left.show()
+            self.tune_center.show()
+            self.tune_right.show()
+        except Exception:
+            pass
 
     def update_spectrum(self, freqs_hz, levels_db, tuned_mhz: float | None = None):
         if freqs_hz is None or len(freqs_hz) == 0:
@@ -97,14 +156,14 @@ class SpectrumWidget(QWidget):
         except Exception:
             return
 
-        # Reposicionar overlay arriba-izquierda del view
+        # overlay arriba-izq
         try:
             (xr, yr) = self.plot.viewRange()
-            self._info.setPos(xr[0], yr[1])  # esquina sup izq
+            self._info.setPos(xr[0], yr[1])
         except Exception:
             pass
 
-        # Texto de rango/centro/span
+        # texto
         try:
             start = float(freqs_mhz[0])
             end = float(freqs_mhz[-1])
@@ -117,10 +176,13 @@ class SpectrumWidget(QWidget):
         except Exception:
             pass
 
+        if tuned_mhz is not None:
+            self.set_tuned_freq_mhz(tuned_mhz)
+
     def set_tuned_freq_mhz(self, mhz: float):
         try:
-            self.tune_line.setPos(float(mhz))
-            self.tune_line.show()
+            self._tuned_mhz = float(mhz)
+            self._refresh_channel_marker()
         except Exception:
             pass
 
@@ -207,6 +269,91 @@ class LeftPanel(QWidget):
         """)
 
 
+class FrequencySpinBox(QDoubleSpinBox):
+    """
+    SpinBox estilo SDR:
+    - Al pasar el mouse sobre un dígito, lo resalta (selección)
+    - Wheel sin necesidad de “focus” (si estás encima)
+    - El paso depende del dígito bajo el cursor (1, 0.1, 0.01, 0.001… MHz)
+    """
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.setFocusPolicy(Qt.StrongFocus)
+        self.setMouseTracking(True)
+        self.lineEdit().setMouseTracking(True)
+        self.lineEdit().installEventFilter(self)
+
+    def _step_from_cursor(self) -> float:
+        txt = self.lineEdit().text()
+        # quitar sufijo si existe
+        txt = txt.replace("MHz", "").strip()
+        # cursor sobre el texto actual del lineEdit
+        cur = self.lineEdit().cursorPosition()
+        if cur < 0:
+            return float(self.singleStep())
+
+        dot = txt.find(".")
+        if dot == -1:
+            # sin decimales -> 1 MHz
+            return 1.0
+
+        # si cursor está a la derecha del punto: decimales
+        if cur > dot:
+            decimals_pos = cur - dot  # 1 => décimas, 2 => centésimas...
+            step = 10 ** (-decimals_pos)
+            return float(step)
+
+        # si cursor está a la izquierda del punto: enteros
+        # distancia al punto define 1,10,100...
+        dist = dot - cur
+        step = 10 ** (dist - 1) if dist >= 1 else 1.0
+        return float(step)
+
+    def eventFilter(self, obj, ev):
+        if obj is self.lineEdit():
+            if ev.type() == QEvent.MouseMove:
+                # seleccionar “token” numérico bajo el cursor
+                txt = self.lineEdit().text()
+                pos = self.lineEdit().cursorPositionAt(ev.position().toPoint())
+                self.lineEdit().setCursorPosition(pos)
+
+                # intenta seleccionar alrededor del cursor (números y punto)
+                # encuentra el rango continuo de [0-9.]
+                start = pos
+                end = pos
+                while start > 0 and (txt[start-1].isdigit() or txt[start-1] == "."):
+                    start -= 1
+                while end < len(txt) and (txt[end].isdigit() or txt[end] == "."):
+                    end += 1
+                if end > start:
+                    self.lineEdit().setSelection(start, end - start)
+                return False
+        return super().eventFilter(obj, ev)
+
+    def wheelEvent(self, event):
+        # permitir wheel si el mouse está encima, incluso sin focus
+        if not self.underMouse():
+            return super().wheelEvent(event)
+
+        step = self._step_from_cursor()
+        delta = event.angleDelta().y()
+        if delta == 0:
+            return
+
+        v = float(self.value())
+        if delta > 0:
+            v += step
+        else:
+            v -= step
+
+        # clamp
+        v = max(self.minimum(), min(self.maximum(), v))
+        self.setValue(v)
+        event.accept()
+
+
+
+
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
@@ -243,6 +390,11 @@ class MainWindow(QMainWindow):
             self.active_driver = self.device_map.get(self.active_device_name, None)
 
         # =========================
+        #  Estado modo (FUENTE ÚNICA)
+        # =========================
+        self.current_mode = "NFM"
+
+        # =========================
         #  Central layout
         # =========================
         central = QWidget()
@@ -254,7 +406,10 @@ class MainWindow(QMainWindow):
         central_layout.addWidget(self.ribbon)
 
         self.waveform = WaveformWidget()
+
         self.spectrum = SpectrumWidget()
+        self.spectrum.set_mode(self.current_mode)  # ✅ marcador 3 líneas inicial
+
         self.waterfall = WaterfallWidget()
 
         bottom_split = QSplitter(Qt.Vertical)
@@ -276,15 +431,15 @@ class MainWindow(QMainWindow):
         #  Docks (Control a la IZQUIERDA / Radios oculto)
         # =========================
         self._build_controls_dock_left()
-          
 
-        
+        # ✅ IMPORTANTE: al crear el dock se crean mode_btn y botones.
+        # Ahora sincronizamos TODO (texto, checks, preset DSP y espectro).
+        if hasattr(self, "_set_mode_from_button"):
+            self._set_mode_from_button(self.current_mode)
+
         self._build_radios_dock_hidden()
-
         self._build_audio_dsp_dock()
         self._build_scanner_dock()
-
-
 
         # =========================
         #  Barra de estado
@@ -335,7 +490,7 @@ class MainWindow(QMainWindow):
         gb_rx = QGroupBox("Receiver / Monitor")
         f_rx = QFormLayout(gb_rx)
 
-        self.freq_spin = QDoubleSpinBox()
+        self.freq_spin = FrequencySpinBox()
         self.freq_spin.setDecimals(6)
         self.freq_spin.setRange(0.0, 6000.0)
         self.freq_spin.setSingleStep(0.0125)
@@ -363,21 +518,110 @@ class MainWindow(QMainWindow):
         # Enter o perder foco => aplica inmediato
         le.editingFinished.connect(self._apply_tune)
 
-        self.mode_combo = QComboBox()
-        self.mode_combo.addItems(["NFM", "AM", "USB", "LSB", "FM"])
-        self.mode_combo.setMinimumHeight(38)
-        self.mode_combo.currentTextChanged.connect(self._apply_mode_preset)
+        # =========================
+        # MODO: botones + desplegable
+        # =========================
+        mode_row = QWidget()
+        mode_lay = QHBoxLayout(mode_row)
+        mode_lay.setContentsMargins(0, 0, 0, 0)
+        mode_lay.setSpacing(6)
 
-       
+        self.mode_btn = QToolButton()
+        self.mode_btn.setText("NFM")
+        self.mode_btn.setMinimumHeight(38)
+        self.mode_btn.setPopupMode(QToolButton.MenuButtonPopup)
 
+        menu = QMenu(self.mode_btn)
+        for m in ["NFM", "AM", "USB", "LSB", "FM"]:
+            act = menu.addAction(m)
+            act.triggered.connect(lambda _=False, mm=m: self._set_mode_from_button(mm))
+        self.mode_btn.setMenu(menu)
+
+        # Botones rápidos (tipo SDR)
+        self.btn_mode_nfm = QPushButton("NFM")
+        self.btn_mode_am  = QPushButton("AM")
+        self.btn_mode_usb = QPushButton("USB")
+        self.btn_mode_lsb = QPushButton("LSB")
+        self.btn_mode_fm  = QPushButton("FM")
+
+        for b, m in [
+            (self.btn_mode_nfm, "NFM"),
+            (self.btn_mode_am,  "AM"),
+            (self.btn_mode_usb, "USB"),
+            (self.btn_mode_lsb, "LSB"),
+            (self.btn_mode_fm,  "FM"),
+        ]:
+            b.setCheckable(True)
+            b.setMinimumHeight(38)
+            b.clicked.connect(lambda _=False, mm=m: self._set_mode_from_button(mm))
+
+        # (Opcional) que se vean “tipo botón SDR”
+        # Si ya tienes stylesheet global, puedes borrar esto.
+        for b in [self.btn_mode_nfm, self.btn_mode_am, self.btn_mode_usb, self.btn_mode_lsb, self.btn_mode_fm]:
+            b.setStyleSheet("""
+                QPushButton {
+                    padding: 6px 10px;
+                    border-radius: 8px;
+                    border: 1px solid #334155;
+                    background: #0b1220;
+                    color: #e5e7eb;
+                    font-weight: 700;
+                }
+                QPushButton:checked {
+                    border: 1px solid rgba(34,197,94,0.9);
+                    background: rgba(34,197,94,0.12);
+                }
+                QPushButton:hover {
+                    background: rgba(148,163,184,0.08);
+                }
+            """)
+
+        self.mode_btn.setStyleSheet("""
+            QToolButton {
+                padding: 6px 10px;
+                border-radius: 8px;
+                border: 1px solid #334155;
+                background: #0b1220;
+                color: #e5e7eb;
+                font-weight: 800;
+            }
+            QToolButton:hover {
+                background: rgba(148,163,184,0.08);
+            }
+        """)
+
+        mode_lay.addWidget(self.btn_mode_nfm)
+        mode_lay.addWidget(self.btn_mode_am)
+        mode_lay.addWidget(self.btn_mode_usb)
+        mode_lay.addWidget(self.btn_mode_lsb)
+        mode_lay.addWidget(self.btn_mode_fm)
+        mode_lay.addWidget(self.mode_btn)
+
+        # Botón Monitor
         self.btn_monitor = QPushButton("▶ MONITOR")
         self.btn_monitor.setMinimumHeight(44)
         self.btn_monitor.clicked.connect(self._toggle_monitor)
 
         f_rx.addRow("Frecuencia", self.freq_spin)
-        f_rx.addRow("Modo", self.mode_combo)
+        f_rx.addRow("Modo", mode_row)     # <-- antes era self.mode_combo
         f_rx.addRow("", self.btn_monitor)
 
+        self.vol_slider = QSlider(Qt.Horizontal)
+        self.vol_slider.setRange(0, 100)
+        self.vol_slider.setValue(70)
+        self.vol_slider.setMinimumHeight(26)
+
+        self.lbl_vol = QLabel("Vol: 70%")
+        self.lbl_vol.setStyleSheet("color:#9ca3af; font-weight:700;")
+
+        self.vol_slider.valueChanged.connect(self._on_volume_changed)
+
+        f_rx.addRow("Volumen", self.vol_slider)
+        f_rx.addRow("", self.lbl_vol)
+
+
+
+        
         # ===== Waterfall =====
         gb_wf = QGroupBox("Waterfall")
         f_wf = QFormLayout(gb_wf)
@@ -397,6 +641,7 @@ class MainWindow(QMainWindow):
         self.controls_dock.setAllowedAreas(Qt.LeftDockWidgetArea | Qt.RightDockWidgetArea)
         self.addDockWidget(Qt.LeftDockWidgetArea, self.controls_dock)
         self.controls_dock.show()
+
 
     def _build_scanner_dock(self):
         w = QWidget()
@@ -496,6 +741,26 @@ class MainWindow(QMainWindow):
         # Auto-aplicar al motor (igual que SDR Console)
         self._apply_audio_dsp_params()
 
+
+    def _set_mode_from_button(self, mode: str):
+        mode = (mode or "").upper().strip() or "NFM"
+
+        # UI: marcar check
+        for b in [self.btn_mode_nfm, self.btn_mode_am, self.btn_mode_usb, self.btn_mode_lsb, self.btn_mode_fm]:
+            b.blockSignals(True)
+            b.setChecked(b.text().upper() == mode)
+            b.blockSignals(False)
+
+        self.mode_btn.setText(mode)
+
+        # aplica preset DSP
+        self._apply_mode_preset(mode)
+
+        # actualiza marcador de ancho de banda en espectro
+        try:
+            self.spectrum.set_mode(mode)
+        except Exception:
+            pass
 
 
 
@@ -776,7 +1041,8 @@ class MainWindow(QMainWindow):
         # START MONITOR
         if not self.is_monitoring:
             freq = float(self.freq_spin.value())
-            mode = self.mode_combo.currentText().strip().upper()
+            mode = self.mode_btn.text().strip().upper()
+
 
             if mode == "FM" and not (88.0 <= freq <= 108.0):
                 QMessageBox.warning(self, "FM", "FM (broadcast) normalmente es 88–108 MHz.")
@@ -1140,6 +1406,16 @@ class MainWindow(QMainWindow):
         # Abre el administrador general
         self._open_banks_dialog()
         self._refresh_scanner_panel()
+
+    def _on_volume_changed(self, v: int):
+        self.lbl_vol.setText(f"Vol: {int(v)}%")
+        # Si tu AudioEngine tiene set_volume, se activa aquí
+        try:
+            if hasattr(self.manager, "audio") and hasattr(self.manager.audio, "set_volume"):
+                self.manager.audio.set_volume(float(v) / 100.0)
+        except Exception:
+            pass
+
 
 
     def _delete_selected_bank(self):

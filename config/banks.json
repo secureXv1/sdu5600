@@ -2,7 +2,7 @@
   "freq_banks": [
     {
       "name": "EMISORAS TEST",
-      "active": false,
+      "active": true,
       "items": [
         {
           "freq_mhz": 91.4,
@@ -23,7 +23,7 @@
   "range_banks": [
     {
       "name": "MI PRIMER ESCANEO",
-      "active": true,
+      "active": false,
       "mode": "FM",
       "range": {
         "start_mhz": 98.0,
