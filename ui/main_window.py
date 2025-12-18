@@ -72,7 +72,7 @@ class SpectrumWidget(QWidget):
 
         self.tune_line = pg.InfiniteLine(
             angle=90, movable=False,
-            pen=pg.mkPen("#22c55e", width=1.3)
+            pen=pg.mkPen("#22c55e", width=2.4)
         )
         self.plot.addItem(self.tune_line)
 
@@ -119,6 +119,37 @@ class SpectrumWidget(QWidget):
 
     def set_tuned_freq_mhz(self, mhz: float):
         self.tune_line.setPos(float(mhz))
+
+    def center_on_mhz(self, mhz: float):
+        """
+        Mueve la ventana visible del espectro (XRange) para que el centro sea 'mhz'.
+        Mantiene el mismo ancho de span que el usuario esté viendo.
+        """
+        try:
+            (x0, x1), (_y0, _y1) = self.plot.viewRange()
+            width = max(0.001, float(x1) - float(x0))  # evita width 0
+            c = float(mhz)
+            self.plot.setXRange(c - width/2.0, c + width/2.0, padding=0.0)
+        except Exception:
+            pass
+
+
+    def set_tuned_freq_mhz(self, mhz: float):
+        try:
+            self.tune_line.setPos(float(mhz))
+            self.tune_line.show()
+        except Exception:
+            pass
+
+    def center_on_mhz(self, mhz: float):
+        try:
+            (x0, x1), (_y0, _y1) = self.plot.viewRange()
+            width = max(0.001, float(x1) - float(x0))
+            c = float(mhz)
+            self.plot.setXRange(c - width/2.0, c + width/2.0, padding=0.0)
+        except Exception:
+            pass
+
 
 
 
@@ -835,27 +866,60 @@ class MainWindow(QMainWindow):
             pass
 
     def _apply_scan_status(self, st):
-        """Actualiza dial/estado visual del escaneo."""
         try:
-            # Dial sin disparar auto-tune del UI
+            # 1) Dial (panel izquierdo)
             self.freq_spin.blockSignals(True)
             self.freq_spin.setValue(float(st.freq_mhz))
             self.freq_spin.blockSignals(False)
 
-            # Línea verde de sintonía + waterfall
+            # 2) Línea de "tuned / scan" en el espectro
             self.spectrum.set_tuned_freq_mhz(float(st.freq_mhz))
+
+            # 3) Centrar la vista del espectro en la frecuencia actual del escaneo
+            self.spectrum.center_on_mhz(float(st.freq_mhz))
+
+            # 4) Waterfall (si existe)
             try:
                 self.waterfall.set_tuned_freq(float(st.freq_mhz) * 1e6)
             except Exception:
                 pass
 
-            # Estado en panel escáner
+            # 5) Texto estado
             if hasattr(self, "lbl_scan_status"):
                 self.lbl_scan_status.setText(
                     f"{st.state} · [{st.bank_kind.upper()}] {st.bank_name} · {st.freq_mhz:.6f} MHz · {st.level_db:.1f} dB"
                 )
         except Exception:
             pass
+
+    def _scan_status_from_thread(self, st):
+        # hilo del scanner -> hilo UI
+        try:
+            QTimer.singleShot(0, lambda s=st: self._apply_scan_status(s))
+        except Exception:
+            pass
+
+    def _apply_scan_status(self, st):
+        try:
+            # Dial
+            self.freq_spin.blockSignals(True)
+            self.freq_spin.setValue(float(st.freq_mhz))
+            self.freq_spin.blockSignals(False)
+
+            # Línea verde + centrar espectro
+            if hasattr(self, "spectrum"):
+                self.spectrum.set_tuned_freq_mhz(float(st.freq_mhz))
+                if hasattr(self.spectrum, "center_on_mhz"):
+                    self.spectrum.center_on_mhz(float(st.freq_mhz))
+
+            # Estado
+            if hasattr(self, "lbl_scan_status"):
+                self.lbl_scan_status.setText(
+                    f"{st.state} · [{st.bank_kind.upper()}] {st.bank_name} · {st.freq_mhz:.6f} MHz · {st.level_db:.1f} dB"
+                )
+        except Exception:
+            pass
+
 
 
 
@@ -928,7 +992,11 @@ class MainWindow(QMainWindow):
                 "Rangos": "RANGE",
             }.get(flt, "ALL")
 
+            flt = self.scan_filter.currentText() if hasattr(self, "scan_filter") else "Todos"
+            kind = {"Todos": "ALL", "Frecuencias": "FREQ", "Rangos": "RANGE"}.get(flt, "ALL")
+
             self.scanner.start(driver, kind_filter=kind, on_status=self._scan_status_from_thread)
+
 
 
             self.btn_scan.setText("Detener escáner")
