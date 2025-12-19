@@ -9,7 +9,9 @@ from PySide6.QtWidgets import (
     QDoubleSpinBox, QSpinBox, QListWidget, QListWidgetItem, QAbstractItemView
 
 )
+from PySide6 import QtCore
 from PySide6.QtCore import Qt, QTimer
+
 from PySide6.QtGui import QAction, QFont, QCursor, QLinearGradient, QColor, QBrush
 
 import pyqtgraph as pg
@@ -61,6 +63,8 @@ class RibbonBar(QWidget):
 
 class SpectrumWidget(QWidget):
     """Display de espectro principal (FFT) estilo SDR."""
+    sig_tune = QtCore.Signal(float, bool)  # mhz, final (True al click / soltar)
+
     MODE_BW_HZ = {
         "NFM": 12_500,
         "FMN": 12_500,
@@ -89,32 +93,21 @@ class SpectrumWidget(QWidget):
         # Curva + relleno (estilo SDR)
         # ==============================
         self.curve = self.plot.plot([], [])
-
-        # Línea del espectro (nítida, clara)
         self.curve.setPen(pg.mkPen("#e5e7eb", width=1.4))
-
-        # Nivel base (piso de ruido)
         self.curve.setFillLevel(-140)
 
-        # Relleno degradado tipo SDR Console
         grad = QLinearGradient(0, -140, 0, -60)
-        grad.setColorAt(0.0, QColor(30, 64, 175, 180))    # azul profundo (piso)
-        grad.setColorAt(1.0, QColor(147, 197, 253, 40))   # azul claro (señales)
-
+        grad.setColorAt(0.0, QColor(30, 64, 175, 180))
+        grad.setColorAt(1.0, QColor(147, 197, 253, 40))
         self.curve.setBrush(QBrush(grad))
-
-
 
         # --- Marcador “canal” (3 líneas + banda sombreada) ---
         self._tuned_mhz = None
         self._mode = "NFM"
 
         self._fft_smooth = None
-        self._fft_alpha = 0.25   # 0.15–0.35 es estilo SDR Console
+        self._fft_alpha = 0.25
 
-
-
-        # Banda sombreada (centro +- BW/2)
         self.chan_region = pg.LinearRegionItem(
             values=[0.0, 0.0],
             movable=False,
@@ -123,7 +116,6 @@ class SpectrumWidget(QWidget):
         )
         self.plot.addItem(self.chan_region)
 
-        # Líneas: izquierda, centro, derecha
         self.tune_left = pg.InfiniteLine(angle=90, movable=False, pen=pg.mkPen("#22c55e", width=1.6))
         self.tune_center = pg.InfiniteLine(angle=90, movable=False, pen=pg.mkPen("#22c55e", width=2.6))
         self.tune_right = pg.InfiniteLine(angle=90, movable=False, pen=pg.mkPen("#22c55e", width=1.6))
@@ -131,12 +123,80 @@ class SpectrumWidget(QWidget):
         self.plot.addItem(self.tune_center)
         self.plot.addItem(self.tune_right)
 
-        # Overlay texto arriba
         self._info = pg.TextItem(color="#e5e7eb", anchor=(0, 0))
         self.plot.addItem(self._info)
 
         v.addWidget(self.plot)
 
+        # =========================
+        # Dial manual (mouse)
+        # =========================
+        self._drag_tuning = False
+        try:
+            sc = self.plot.scene()
+            sc.sigMouseMoved.connect(self._on_scene_mouse_moved)
+            sc.sigMouseClicked.connect(self._on_scene_mouse_clicked)
+        except Exception:
+            pass
+
+    # ----------------------------
+    # Dial manual helpers
+    # ----------------------------
+    def _mhz_from_scene_pos(self, scene_pos) -> float | None:
+        """Convierte posición del mouse a MHz (eje X del Plot)."""
+        try:
+            vb = self.plot.getViewBox()
+            p = vb.mapSceneToView(scene_pos)
+            x_mhz = float(p.x())
+        except Exception:
+            return None
+
+        # Clamp al rango visible (evita valores raros cuando el mouse está fuera)
+        try:
+            xr = self.plot.viewRange()[0]  # [xmin, xmax]
+            xmin = float(xr[0])
+            xmax = float(xr[1])
+            if xmax < xmin:
+                xmin, xmax = xmax, xmin
+            x_mhz = max(xmin, min(xmax, x_mhz))
+        except Exception:
+            pass
+
+        return x_mhz
+
+    def _on_scene_mouse_clicked(self, ev):
+        """Click izquierdo: sintoniza y aplica final inmediato."""
+        try:
+            if ev.button() != Qt.LeftButton:
+                return
+            mhz = self._mhz_from_scene_pos(ev.scenePos())
+            if mhz is None:
+                return
+        except Exception:
+            return
+
+        self.sig_tune.emit(float(mhz), True)
+
+    def _on_scene_mouse_moved(self, scene_pos):
+        """Drag con botón izquierdo presionado: sintoniza en vivo (final=False)."""
+        try:
+            buttons = QtCore.QCoreApplication.mouseButtons()
+            if not (buttons & Qt.LeftButton):
+                self._drag_tuning = False
+                return
+        except Exception:
+            return
+
+        mhz = self._mhz_from_scene_pos(scene_pos)
+        if mhz is None:
+            return
+
+        self._drag_tuning = True
+        self.sig_tune.emit(float(mhz), False)
+
+    # ----------------------------
+    # Funcionalidad actual
+    # ----------------------------
     def set_mode(self, mode: str):
         self._mode = (mode or "").upper().strip() or "NFM"
         self._refresh_channel_marker()
@@ -165,16 +225,13 @@ class SpectrumWidget(QWidget):
         except Exception:
             pass
 
-
     def update_spectrum(self, freqs_hz, levels_db, tuned_mhz: float | None = None):
         if freqs_hz is None or len(freqs_hz) == 0:
             return
 
         freqs_mhz = (freqs_hz / 1e6) if hasattr(freqs_hz, "__array__") else [f / 1e6 for f in freqs_hz]
 
-        # --------- Suavizado EMA (SDR-like) ----------
         levels = np.asarray(levels_db, dtype=np.float32)
-
         if self._fft_smooth is None or len(self._fft_smooth) != len(levels):
             self._fft_smooth = levels.copy()
         else:
@@ -214,7 +271,6 @@ class SpectrumWidget(QWidget):
         if tuned_mhz is not None:
             self.set_tuned_freq_mhz(tuned_mhz)
 
-
     def set_tuned_freq_mhz(self, mhz: float):
         try:
             self._tuned_mhz = float(mhz)
@@ -230,8 +286,6 @@ class SpectrumWidget(QWidget):
             self.plot.setXRange(c - width/2.0, c + width/2.0, padding=0.0)
         except Exception:
             pass
-
-
 
 
 
@@ -393,8 +447,14 @@ class FrequencySpinBox(QDoubleSpinBox):
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
+
+        
+                # ✅ Definir estado ANTES de conectar señales/armar UI
+        self.is_monitoring = False
+
         self.setWindowTitle("Remote Radios Station – SDR Style")
         self.resize(1500, 850)
+
 
         # =========================
         #  Manager y tarjetas
@@ -444,9 +504,37 @@ class MainWindow(QMainWindow):
         self.waveform = WaveformWidget()
 
         self.spectrum = SpectrumWidget()
+
+                # =========================
+        # Dial manual desde espectro
+        # =========================
+        self._spec_tune_timer = QTimer(self)
+        self._spec_tune_timer.setSingleShot(True)
+        self._spec_tune_timer.setInterval(60)  # throttle
+        self._spec_tune_timer.timeout.connect(self._apply_tune)
+
+        try:
+            self.spectrum.sig_tune.connect(self._on_spectrum_tune)
+        except Exception:
+            pass
+
         self.spectrum.set_mode(self.current_mode)  # ✅ marcador 3 líneas inicial
 
         self.waterfall = WaterfallWidget()
+
+                # =========================
+        # Dial manual en waterfall (mouse -> tune)
+        # =========================
+        self._wf_tune_timer = QTimer(self)
+        self._wf_tune_timer.setSingleShot(True)
+        self._wf_tune_timer.setInterval(60)  # throttle (ms) para que no “ahogue” el driver
+        self._wf_tune_timer.timeout.connect(self._apply_tune)
+
+        try:
+            self.waterfall.sig_tune.connect(self._on_waterfall_tune)
+        except Exception:
+            pass
+
 
         bottom_split = QSplitter(Qt.Vertical)
         bottom_split.addWidget(self.spectrum)
@@ -829,6 +917,33 @@ class MainWindow(QMainWindow):
 
 
 
+    def _on_spectrum_tune(self, mhz: float, final: bool):
+        # Si escáner está corriendo, no peleamos con él
+        try:
+            if getattr(self, "scanner", None) is not None and getattr(self.scanner, "is_running", False):
+                return
+        except Exception:
+            pass
+
+        mhz = float(mhz)
+
+        # Actualiza spin sin disparar eventos
+        try:
+            self.freq_spin.blockSignals(True)
+            self.freq_spin.setValue(mhz)
+            self.freq_spin.blockSignals(False)
+        except Exception:
+            pass
+
+        if final:
+            self._spec_tune_timer.stop()
+            self._apply_tune()
+            return
+
+        self._spec_tune_timer.start()
+
+
+
 
 
     def _build_radios_dock_hidden(self):
@@ -1075,6 +1190,35 @@ class MainWindow(QMainWindow):
                 self.active_driver.set_center_freq(mhz * 1e6)
             except Exception as e:
                 QMessageBox.warning(self, "TUNE", f"No se pudo sintonizar: {e}")
+
+
+    def _on_waterfall_tune(self, mhz: float, final: bool):
+            # Si el escáner está corriendo, evitamos que el dial pelee con el scanner
+                try:
+                    if getattr(self, "scanner", None) is not None and getattr(self.scanner, "is_running", False):
+                        return
+                except Exception:
+                    pass
+
+                mhz = float(mhz)
+
+                # Actualiza el dial sin disparar valueChanged
+                try:
+                    self.freq_spin.blockSignals(True)
+                    self.freq_spin.setValue(mhz)
+                    self.freq_spin.blockSignals(False)
+                except Exception:
+                    pass
+
+                # Si es “final” (solté mouse), aplica ya
+                if final:
+                    self._wf_tune_timer.stop()
+                    self._apply_tune()
+                    return
+
+                # Mientras arrastras: throttle + aplica tune suave
+                self._wf_tune_timer.start()
+
 
 
     # ---------- Monitor ----------

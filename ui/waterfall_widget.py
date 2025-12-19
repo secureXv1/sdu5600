@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from PySide6.QtWidgets import QWidget, QVBoxLayout
 from PySide6 import QtCore
+from PySide6.QtCore import Qt
 import pyqtgraph as pg
 import numpy as np
 
@@ -19,6 +20,7 @@ class WaterfallWidget(QWidget):
       wf.set_tuned_freq(hz)
       wf.set_mode(mode)   # para ajustar ancho (opcional)
     """
+    sig_tune = QtCore.Signal(float, bool)
 
     MODE_BW_HZ = {
         "NFM": 12_500,
@@ -68,6 +70,12 @@ class WaterfallWidget(QWidget):
         self.img_item = pg.ImageItem()
         self.img_item.setOpts(axisOrder="row-major")
         self.plot.addItem(self.img_item)
+
+        self._drag_tuning = False
+
+        # Captura mouse de la escena de pyqtgraph
+        self.plot.scene().sigMouseClicked.connect(self._on_scene_mouse_clicked)
+        self.plot.scene().sigMouseMoved.connect(self._on_scene_mouse_moved)
 
         # Colormap SDR-like
         # CET-L9: azules/negros tipo SDR (muy bonito)
@@ -246,3 +254,63 @@ class WaterfallWidget(QWidget):
             f"{mhz:.6f} MHz"
             "</div>"
         )
+
+    
+        # ----------------------------
+    # Dial manual (mouse)
+    # ----------------------------
+    def _mhz_from_scene_pos(self, scene_pos) -> float | None:
+        try:
+            vb = self.plot.getViewBox()
+            p = vb.mapSceneToView(scene_pos)
+            x_mhz = float(p.x())
+        except Exception:
+            return None
+
+        # clamp al rango del waterfall
+        try:
+            xmin = float(self._f_start_hz) / 1e6
+            xmax = float(self._f_stop_hz) / 1e6
+            if xmax < xmin:
+                xmin, xmax = xmax, xmin
+            x_mhz = max(xmin, min(xmax, x_mhz))
+        except Exception:
+            pass
+
+        return x_mhz
+
+    def _on_scene_mouse_clicked(self, ev):
+        # Click izquierdo activa dial; al soltar aplica final=True
+        try:
+            if ev.button() != Qt.LeftButton:
+                return
+            scene_pos = ev.scenePos()
+        except Exception:
+            return
+
+        mhz = self._mhz_from_scene_pos(scene_pos)
+        if mhz is None:
+            return
+
+        # Si viene un click "normal", lo tratamos como: comenzar tuning + final inmediato
+        # (pero si quieres SOLO con drag, comenta esta línea y deja solo drag)
+        self.sig_tune.emit(float(mhz), True)
+
+    def _on_scene_mouse_moved(self, scene_pos):
+        # Solo sintoniza mientras el botón izquierdo esté presionado (drag)
+        try:
+            buttons = QtCore.QCoreApplication.mouseButtons()
+            if not (buttons & Qt.LeftButton):
+                self._drag_tuning = False
+                return
+        except Exception:
+            return
+
+        mhz = self._mhz_from_scene_pos(scene_pos)
+        if mhz is None:
+            return
+
+        self._drag_tuning = True
+        # final=False mientras arrastras (throttle lo hace MainWindow)
+        self.sig_tune.emit(float(mhz), False)
+

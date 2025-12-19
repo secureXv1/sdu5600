@@ -2,7 +2,7 @@
   "freq_banks": [
     {
       "name": "EMISORAS TEST",
-      "active": true,
+      "active": false,
       "items": [
         {
           "freq_mhz": 91.4,
@@ -36,6 +36,22 @@
         "amp": false
       },
       "id": "rb_e8685be6"
+    },
+    {
+      "name": "UHF",
+      "active": true,
+      "mode": "NFM",
+      "range": {
+        "start_mhz": 140.0,
+        "stop_mhz": 150.0,
+        "ts_khz": 25.0
+      },
+      "rf_gain": {
+        "lna_db": 32,
+        "vga_db": 20,
+        "amp": false
+      },
+      "id": "rb_3f2f48ad"
     }
   ],
   "scan_settings": {
