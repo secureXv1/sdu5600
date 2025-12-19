@@ -8,6 +8,9 @@ import numpy as np
 import sounddevice as sd
 
 
+# =========================================================
+# FIR / helpers
+# =========================================================
 def fir_lowpass(num_taps: int, cutoff_hz: float, fs: float) -> np.ndarray:
     fc = float(cutoff_hz) / float(fs)
     n = np.arange(num_taps) - (num_taps - 1) / 2.0
@@ -43,10 +46,6 @@ def deemph(x: np.ndarray, fs: int, tau: float, state: float):
 
 
 def hpf_1pole(x: np.ndarray, fs: int, cutoff_hz: float, state_x: float, state_y: float):
-    """
-    HPF 1er orden: y[n] = a*(y[n-1] + x[n] - x[n-1])
-    Retorna (y, new_state_x, new_state_y)
-    """
     if cutoff_hz <= 0:
         return x.astype(np.float32, copy=False), float(state_x), float(state_y)
 
@@ -65,7 +64,6 @@ def hpf_1pole(x: np.ndarray, fs: int, cutoff_hz: float, state_x: float, state_y:
     return y, px, py
 
 
-
 def iq_from_int8_bytes(data: bytes) -> np.ndarray:
     a = np.frombuffer(data, dtype=np.int8)
     if a.size < 4:
@@ -75,30 +73,39 @@ def iq_from_int8_bytes(data: bytes) -> np.ndarray:
     i = a[0::2].astype(np.float32)
     q = a[1::2].astype(np.float32)
     iq = (i + 1j * q) / 128.0
-    # DC remove
-    iq = iq - np.mean(iq)
+    iq -= np.mean(iq)
     return iq.astype(np.complex64, copy=False)
 
 
+# =========================================================
+# WBFM Stream
+# =========================================================
 class WBFMStream:
     """
-    WBFM desde cola de IQ bytes (I,Q int8 intercalado).
-    Pipeline:
-      2.4M -> LP 120k -> decim 10 -> 240k -> demod -> LP 15k -> decim 5 -> 48k
+    WBFM / FM DSP (base para NBFM)
+
+    ✔ Volumen real
+    ✔ Parámetros en vivo
+    ✔ Estable tipo SDR Console
     """
+
     def __init__(self, iq_bytes_queue: "queue.Queue[bytes]", freq_mhz: float, on_audio=None):
         self.freq_hz = int(freq_mhz * 1e6)
 
         self.fs = 2_400_000
         self.fs1 = 240_000
         self.audio_fs = 48_000
-        self.decim1 = self.fs // self.fs1       # 10
-        self.decim2 = self.fs1 // self.audio_fs # 5
+        self.decim1 = self.fs // self.fs1
+        self.decim2 = self.fs1 // self.audio_fs
 
         self.iq_bytes_q = iq_bytes_queue
+        self.on_audio = on_audio
 
-        # ---- Params en vivo (tuneables) ----
+        # ==========================
+        # DSP params (en vivo)
+        # ==========================
         self._param_lock = threading.Lock()
+
         self.chan_taps = 161
         self.aud_taps = 161
         self.chan_cutoff_hz = 110_000.0
@@ -106,7 +113,14 @@ class WBFMStream:
         self.tau = 90e-6
         self.drive = 1.2
 
-        # filtros (reconstruibles en caliente)
+        # HPF (NFM hereda)
+        self.hpf_hz = 0.0
+        self.hpf_x1 = 0.0
+        self.hpf_y1 = 0.0
+
+        # 🔊 volumen real
+        self.volume = 1.0
+
         self._rebuild_filters()
 
         self.prev_iq = 0.0 + 0.0j
@@ -116,32 +130,16 @@ class WBFMStream:
 
         self._running = False
         self._thr: threading.Thread | None = None
-
-        # bloque fijo (10 ms) => audio limpio y estable
-        self.block_iq = 24_000  # 2.4e6 * 0.010s
-        self._bytes_buf = b""
-        self.on_audio = on_audio  # callback opcional para grabación
         self._stop_evt = threading.Event()
 
-                # ---- Params en vivo (tuneables) ----
-        self.hpf_hz = 0.0  # 0=off, NFM típico 300 Hz
-        self.hpf_x1 = 0.0
-        self.hpf_y1 = 0.0
+        self.block_iq = 24_000
+        self._bytes_buf = b""
 
-
-
-
-    def _rebuild_filters(self):
-        # clamp básico para evitar cutoffs inválidos
-        chan_cut = float(max(1.0, min(self.chan_cutoff_hz, (self.fs  * 0.49))))
-        aud_cut  = float(max(50.0, min(self.aud_cutoff_hz,  (self.fs1 * 0.49))))
-
-        self.chan_fir = fir_lowpass(int(self.chan_taps), chan_cut, self.fs)
-        self.chan_zi_r = np.zeros(len(self.chan_fir) - 1, dtype=np.float32)
-        self.chan_zi_i = np.zeros(len(self.chan_fir) - 1, dtype=np.float32)
-
-        self.aud_fir = fir_lowpass(int(self.aud_taps), aud_cut, self.fs1)
-        self.aud_zi = np.zeros(len(self.aud_fir) - 1, dtype=np.float32)
+    # -------------------------------------------------
+    # API AudioEngine
+    # -------------------------------------------------
+    def set_volume(self, v: float):
+        self.volume = max(0.0, min(1.0, float(v)))
 
     def update_params(
         self,
@@ -151,8 +149,8 @@ class WBFMStream:
         drive: float | None = None,
         chan_taps: int | None = None,
         aud_taps: int | None = None,
+        hpf_hz: float | None = None,
     ):
-        """Actualiza parámetros en caliente. tau_us en microsegundos."""
         with self._param_lock:
             if chan_cutoff_hz is not None:
                 self.chan_cutoff_hz = float(chan_cutoff_hz)
@@ -168,16 +166,31 @@ class WBFMStream:
                 self.aud_taps = int(aud_taps)
             if hpf_hz is not None:
                 self.hpf_hz = float(hpf_hz)
+
             self._rebuild_filters()
 
-            
+    # -------------------------------------------------
+    # Internos DSP
+    # -------------------------------------------------
+    def _rebuild_filters(self):
+        chan_cut = max(1.0, min(self.chan_cutoff_hz, self.fs * 0.49))
+        aud_cut = max(50.0, min(self.aud_cutoff_hz, self.fs1 * 0.49))
+
+        self.chan_fir = fir_lowpass(self.chan_taps, chan_cut, self.fs)
+        self.chan_zi_r = np.zeros(len(self.chan_fir) - 1, np.float32)
+        self.chan_zi_i = np.zeros(len(self.chan_fir) - 1, np.float32)
+
+        self.aud_fir = fir_lowpass(self.aud_taps, aud_cut, self.fs1)
+        self.aud_zi = np.zeros(len(self.aud_fir) - 1, np.float32)
+
+    # -------------------------------------------------
+    # Start / Stop
+    # -------------------------------------------------
     def start(self):
         if self._running:
             return
         self._running = True
-
         self._stop_evt.clear()
-
 
         self._thr = threading.Thread(target=self._dsp_loop, daemon=True)
         self._thr.start()
@@ -189,7 +202,6 @@ class WBFMStream:
             with sd.OutputStream(dtype="float32", blocksize=2048, callback=self._audio_cb):
                 while self._running and not self._stop_evt.is_set():
                     time.sleep(0.05)
-
         finally:
             self.stop()
 
@@ -197,9 +209,11 @@ class WBFMStream:
         self._running = False
         self._stop_evt.set()
 
-
+    # -------------------------------------------------
+    # DSP loop
+    # -------------------------------------------------
     def _dsp_loop(self):
-        need_bytes = int(self.block_iq) * 2  # I,Q int8
+        need_bytes = int(self.block_iq) * 2
         while self._running:
             try:
                 chunk = self.iq_bytes_q.get(timeout=0.25)
@@ -216,56 +230,56 @@ class WBFMStream:
                 if iq.size < 8:
                     continue
 
-                # canal
                 iq_f, self.chan_zi_r, self.chan_zi_i = fir_stream_cplx(
                     iq, self.chan_fir, self.chan_zi_r, self.chan_zi_i
                 )
                 iq_240k = iq_f[::self.decim1]
 
-                # demod FM
                 x = np.empty_like(iq_240k)
                 x[0] = self.prev_iq
                 x[1:] = iq_240k[:-1]
                 self.prev_iq = iq_240k[-1]
                 fm = np.angle(iq_240k * np.conj(x)).astype(np.float32)
 
-                # audio
                 fm_f, self.aud_zi = fir_stream(fm, self.aud_fir, self.aud_zi)
                 audio = fm_f[::self.decim2]
 
                 audio, self.de_state = deemph(audio, self.audio_fs, self.tau, self.de_state)
+
+                audio, self.hpf_x1, self.hpf_y1 = hpf_1pole(
+                    audio, self.audio_fs, self.hpf_hz, self.hpf_x1, self.hpf_y1
+                )
+
                 with self._param_lock:
                     drive = float(self.drive)
-                audio = np.tanh(audio * drive).astype(np.float32)
-
-                audio, self.de_state = deemph(audio, self.audio_fs, self.tau, self.de_state)
-
-                with self._param_lock:
-                    drive = float(self.drive)
-                    hpf = float(self.hpf_hz)
-
-                audio, self.hpf_x1, self.hpf_y1 = hpf_1pole(audio, self.audio_fs, hpf, self.hpf_x1, self.hpf_y1)
 
                 audio = np.tanh(audio * drive).astype(np.float32)
 
-
+                # 🔊 volumen real
+                audio *= self.volume
 
                 try:
                     self.audio_q.put_nowait(audio)
                 except queue.Full:
                     pass
 
+    # -------------------------------------------------
+    # Audio callback
+    # -------------------------------------------------
     def _audio_cb(self, outdata, frames, _time, _status):
         out = np.zeros(frames, dtype=np.float32)
         filled = 0
+
         while filled < frames:
             try:
                 chunk = self.audio_q.get_nowait()
             except queue.Empty:
                 break
+
             n = min(frames - filled, chunk.size)
             out[filled:filled + n] = chunk[:n]
             filled += n
+
             rest = chunk[n:]
             if rest.size:
                 try:
@@ -274,7 +288,6 @@ class WBFMStream:
                     pass
                 break
 
-        # ✅ TAP para grabación (ScannerEngine) — fuera del while
         if self.on_audio is not None and filled > 0:
             try:
                 self.on_audio(out[:filled].copy())
@@ -282,4 +295,3 @@ class WBFMStream:
                 pass
 
         outdata[:, 0] = out
-

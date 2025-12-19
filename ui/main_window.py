@@ -10,9 +10,12 @@ from PySide6.QtWidgets import (
 
 )
 from PySide6.QtCore import Qt, QTimer
-from PySide6.QtGui import QAction, QFont, QCursor
+from PySide6.QtGui import QAction, QFont, QCursor, QLinearGradient, QColor, QBrush
 
 import pyqtgraph as pg
+
+import numpy as np
+
 import threading
 import re
 import math
@@ -82,14 +85,34 @@ class SpectrumWidget(QWidget):
         self.plot.enableAutoRange(x=False, y=False)
         self.plot.setYRange(-140, 0, padding=0.0)
 
-        # Curva + relleno (tipo SDR)
-        self.curve = self.plot.plot([], [], pen=pg.mkPen("#e5e7eb", width=1.2))
+        # ==============================
+        # Curva + relleno (estilo SDR)
+        # ==============================
+        self.curve = self.plot.plot([], [])
+
+        # Línea del espectro (nítida, clara)
+        self.curve.setPen(pg.mkPen("#e5e7eb", width=1.4))
+
+        # Nivel base (piso de ruido)
         self.curve.setFillLevel(-140)
-        self.curve.setBrush(pg.mkBrush(255, 255, 255, 35))
+
+        # Relleno degradado tipo SDR Console
+        grad = QLinearGradient(0, -140, 0, -60)
+        grad.setColorAt(0.0, QColor(30, 64, 175, 180))    # azul profundo (piso)
+        grad.setColorAt(1.0, QColor(147, 197, 253, 40))   # azul claro (señales)
+
+        self.curve.setBrush(QBrush(grad))
+
+
 
         # --- Marcador “canal” (3 líneas + banda sombreada) ---
         self._tuned_mhz = None
         self._mode = "NFM"
+
+        self._fft_smooth = None
+        self._fft_alpha = 0.25   # 0.15–0.35 es estilo SDR Console
+
+
 
         # Banda sombreada (centro +- BW/2)
         self.chan_region = pg.LinearRegionItem(
@@ -142,16 +165,28 @@ class SpectrumWidget(QWidget):
         except Exception:
             pass
 
+
     def update_spectrum(self, freqs_hz, levels_db, tuned_mhz: float | None = None):
         if freqs_hz is None or len(freqs_hz) == 0:
             return
 
         freqs_mhz = (freqs_hz / 1e6) if hasattr(freqs_hz, "__array__") else [f / 1e6 for f in freqs_hz]
-        self.curve.setData(freqs_mhz, levels_db)
+
+        # --------- Suavizado EMA (SDR-like) ----------
+        levels = np.asarray(levels_db, dtype=np.float32)
+
+        if self._fft_smooth is None or len(self._fft_smooth) != len(levels):
+            self._fft_smooth = levels.copy()
+        else:
+            a = float(getattr(self, "_fft_alpha", 0.25))
+            self._fft_smooth = a * levels + (1.0 - a) * self._fft_smooth
+
+        self.curve.setData(freqs_mhz, self._fft_smooth)
 
         # fija X al span recibido
         try:
-            x0 = float(freqs_mhz[0]); x1 = float(freqs_mhz[-1])
+            x0 = float(freqs_mhz[0])
+            x1 = float(freqs_mhz[-1])
             self.plot.setXRange(x0, x1, padding=0.0)
         except Exception:
             return
@@ -178,6 +213,7 @@ class SpectrumWidget(QWidget):
 
         if tuned_mhz is not None:
             self.set_tuned_freq_mhz(tuned_mhz)
+
 
     def set_tuned_freq_mhz(self, mhz: float):
         try:
@@ -745,22 +781,52 @@ class MainWindow(QMainWindow):
     def _set_mode_from_button(self, mode: str):
         mode = (mode or "").upper().strip() or "NFM"
 
-        # UI: marcar check
-        for b in [self.btn_mode_nfm, self.btn_mode_am, self.btn_mode_usb, self.btn_mode_lsb, self.btn_mode_fm]:
+        # =========================
+        # UI: marcar botones
+        # =========================
+        for b in [
+            self.btn_mode_nfm,
+            self.btn_mode_am,
+            self.btn_mode_usb,
+            self.btn_mode_lsb,
+            self.btn_mode_fm,
+        ]:
             b.blockSignals(True)
             b.setChecked(b.text().upper() == mode)
             b.blockSignals(False)
 
         self.mode_btn.setText(mode)
 
-        # aplica preset DSP
+        # =========================
+        # Preset DSP (IF / AF / etc.)
+        # =========================
         self._apply_mode_preset(mode)
 
-        # actualiza marcador de ancho de banda en espectro
+        # =========================
+        # 🔥 CAMBIO DE MODO EN VIVO (AUDIO)
+        # =========================
+        try:
+            if self.is_monitoring and hasattr(self.manager, "audio"):
+                self.manager.audio.set_mode(mode)
+        except Exception as e:
+            print("Error cambiando modo de audio:", e)
+
+        # =========================
+        # Espectro: ancho de banda / marcador
+        # =========================
         try:
             self.spectrum.set_mode(mode)
         except Exception:
             pass
+
+        # =========================
+        # Waterfall: ancho de banda
+        # =========================
+        try:
+            self.waterfall.set_mode(mode)
+        except Exception:
+            pass
+
 
 
 
