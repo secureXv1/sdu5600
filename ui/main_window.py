@@ -62,7 +62,6 @@ class RibbonBar(QWidget):
 
 
 class SpectrumWidget(QWidget):
-    """Display de espectro principal (FFT) estilo SDR."""
     sig_tune = QtCore.Signal(float, bool)  # mhz, final
 
     MODE_BW_HZ = {
@@ -85,10 +84,9 @@ class SpectrumWidget(QWidget):
         self.plot.setLabel("bottom", "Frecuencia", units="MHz")
         self.plot.setLabel("left", "Nivel", units="dB")
 
-        vb = self.plot.getViewBox()
-        vb.setMouseEnabled(x=True, y=False)      # solo X
-        vb.enableAutoRange(x=False, y=False)
-        self.plot.setYRange(-80, 20, padding=0.0)
+        self.vb = self.plot.getViewBox()
+        self.vb.setMouseEnabled(x=True, y=False)     # solo X
+        self.vb.enableAutoRange(x=False, y=False)
 
         # Curva + relleno
         self.curve = self.plot.plot([], [])
@@ -106,18 +104,17 @@ class SpectrumWidget(QWidget):
         self._fft_smooth = None
         self._fft_alpha = 0.25
 
-        # Pan
         self._full_xmin = None
         self._full_xmax = None
+        self._span = None
         self._view_width = None
         self._x_inited = False
 
-        # Auto-Y suave
         self._y_auto_lo = None
         self._y_auto_hi = None
 
-        # Anti-recursión
         self._sync_lock = False
+        self._syncing_slider = False
 
         # Región canal (extremos ajustables)
         self.chan_region = pg.LinearRegionItem(
@@ -150,13 +147,13 @@ class SpectrumWidget(QWidget):
         self.tune_center.sigPositionChanged.connect(self._on_center_changed_live)
         self.tune_center.sigPositionChangeFinished.connect(self._on_center_changed_final)
 
-        # Overlay texto
+        # Overlay
         self._info = pg.TextItem(color="#e5e7eb", anchor=(0, 0))
         self.plot.addItem(self._info)
 
         v.addWidget(self.plot)
 
-        # Barra PAN
+        # Barra inferior PAN (siempre visible)
         self.pan_slider = QSlider(Qt.Horizontal)
         self.pan_slider.setRange(0, 1000)
         self.pan_slider.setSingleStep(1)
@@ -166,7 +163,13 @@ class SpectrumWidget(QWidget):
         self.pan_slider.valueChanged.connect(self._on_pan_slider)
         v.addWidget(self.pan_slider)
 
-        # Dial manual por mouse (click/drag en plot)
+        # Sync slider cuando el usuario pan/zoom con mouse
+        try:
+            self.vb.sigRangeChanged.connect(self._on_view_range_changed)
+        except Exception:
+            pass
+
+        # Mouse tune (click/drag)
         self._drag_tuning = False
         try:
             sc = self.plot.scene()
@@ -176,16 +179,14 @@ class SpectrumWidget(QWidget):
             pass
 
     # ----------------------------
-    # Mouse tune (click/drag)
+    # Mouse tune
     # ----------------------------
     def _mhz_from_scene_pos(self, scene_pos) -> float | None:
         try:
-            vb = self.plot.getViewBox()
-            p = vb.mapSceneToView(scene_pos)
+            p = self.vb.mapSceneToView(scene_pos)
             x_mhz = float(p.x())
         except Exception:
             return None
-
         try:
             xr = self.plot.viewRange()[0]
             xmin = float(xr[0])
@@ -195,7 +196,6 @@ class SpectrumWidget(QWidget):
             x_mhz = max(xmin, min(xmax, x_mhz))
         except Exception:
             pass
-
         return x_mhz
 
     def _on_scene_mouse_clicked(self, ev):
@@ -243,7 +243,6 @@ class SpectrumWidget(QWidget):
         c = float(self._tuned_mhz)
         left = c - (bw / 2.0)
         right = c + (bw / 2.0)
-
         try:
             self.chan_region.setRegion((left, right))
             self.tune_left.setPos(left)
@@ -257,7 +256,7 @@ class SpectrumWidget(QWidget):
             pass
 
     # ----------------------------
-    # Update spectrum
+    # Spectrum update
     # ----------------------------
     def update_spectrum(self, freqs_hz, levels_db, tuned_mhz: float | None = None):
         if freqs_hz is None or len(freqs_hz) == 0:
@@ -274,24 +273,21 @@ class SpectrumWidget(QWidget):
 
         self.curve.setData(freqs_mhz, self._fft_smooth)
 
-        # límites X reales
         try:
             xmin = float(freqs_mhz[0])
             xmax = float(freqs_mhz[-1])
+            if xmax < xmin:
+                xmin, xmax = xmax, xmin
         except Exception:
             return
 
-        self._update_pan_limits(xmin, xmax)
+        self._update_limits_and_constraints(xmin, xmax)
 
-        # inicializa X una vez (y reencausa si se salió)
-        try:
-            if not self._x_inited:
-                self.plot.setXRange(self._full_xmin, self._full_xmax, padding=0.0)
-                self._x_inited = True
-        except Exception:
-            pass
+        if not self._x_inited:
+            self.plot.setXRange(self._full_xmin, self._full_xmax, padding=0.0)
+            self._x_inited = True
 
-        # Auto Y suave (para que no se "aplane" al volver)
+        # Auto-Y suave
         try:
             y = self._fft_smooth
             y = y[np.isfinite(y)]
@@ -312,14 +308,13 @@ class SpectrumWidget(QWidget):
         except Exception:
             pass
 
-        # overlay arriba-izq
+        # Overlay pos + texto
         try:
             (xr, yr) = self.plot.viewRange()
             self._info.setPos(xr[0], yr[1])
         except Exception:
             pass
 
-        # texto
         try:
             start = float(freqs_mhz[0])
             end = float(freqs_mhz[-1])
@@ -344,78 +339,85 @@ class SpectrumWidget(QWidget):
         except Exception:
             pass
 
-    def center_on_mhz(self, mhz: float):
-        try:
-            if self._full_xmin is None or self._full_xmax is None:
-                return
-            span = max(0.000001, self._full_xmax - self._full_xmin)
-            w = min(float(self._view_width or span), span)
-            c = float(mhz)
-            x0 = c - w / 2.0
-            x1 = c + w / 2.0
-            if x0 < self._full_xmin:
-                x0 = self._full_xmin
-                x1 = x0 + w
-            if x1 > self._full_xmax:
-                x1 = self._full_xmax
-                x0 = x1 - w
-            self.plot.setXRange(x0, x1, padding=0.0)
-        except Exception:
-            pass
-
-    # =========================
-    # PAN (barra inferior)
-    # =========================
-    def _update_pan_limits(self, xmin: float, xmax: float):
+    # ----------------------------
+    # Constraints + slider sync
+    # ----------------------------
+    def _update_limits_and_constraints(self, xmin: float, xmax: float):
         self._full_xmin = float(xmin)
         self._full_xmax = float(xmax)
+        self._span = max(0.000001, self._full_xmax - self._full_xmin)
 
-        span = max(0.000001, self._full_xmax - self._full_xmin)
-
+        # ✅ Permite zoom-out SOLO hasta el span real (evita que "se vea una parte")
         try:
-            (xr, _yr) = self.plot.viewRange()
-            cur_w = max(0.000001, float(xr[1]) - float(xr[0]))
-        except Exception:
-            cur_w = span
-
-        self._view_width = min(cur_w, span)
-
-        try:
-            (xr, _yr) = self.plot.viewRange()
-            x0 = float(xr[0])
-            x1 = float(xr[1])
-            if (x1 - x0) > span or x0 < self._full_xmin or x1 > self._full_xmax:
-                self.plot.setXRange(self._full_xmin, self._full_xmax, padding=0.0)
+            self.vb.setLimits(
+                xMin=self._full_xmin,
+                xMax=self._full_xmax,
+                minXRange=0.00005,         # zoom-in permitido
+                maxXRange=self._span       # zoom-out máximo = span
+            )
         except Exception:
             pass
 
+        try:
+            (xr, _yr) = self.plot.viewRange()
+            self._view_width = max(0.000001, float(xr[1]) - float(xr[0]))
+        except Exception:
+            self._view_width = self._span
+
+    def _on_view_range_changed(self, *_args):
+        if self._full_xmin is None or self._full_xmax is None:
+            return
+        try:
+            (xr, _yr) = self.plot.viewRange()
+            self._view_width = max(0.000001, float(xr[1]) - float(xr[0]))
+        except Exception:
+            return
         self._sync_pan_slider_from_view()
 
     def _sync_pan_slider_from_view(self):
         if self._full_xmin is None or self._full_xmax is None or not self._view_width:
             return
 
+        span = max(0.000001, self._full_xmax - self._full_xmin)
+        w = float(self._view_width)
+
+        # si w >= span, slider centrado
+        if w >= span:
+            self._syncing_slider = True
+            self.pan_slider.blockSignals(True)
+            self.pan_slider.setValue(500)
+            self.pan_slider.blockSignals(False)
+            self._syncing_slider = False
+            return
+
         try:
             (xr, _yr) = self.plot.viewRange()
             x0 = float(xr[0])
         except Exception:
             return
 
-        span = (self._full_xmax - self._full_xmin)
-        travel = max(0.000001, span - self._view_width)
-        t = (x0 - self._full_xmin) / travel if travel > 0 else 0.5
+        travel = max(0.000001, span - w)
+        t = (x0 - self._full_xmin) / travel
         t = max(0.0, min(1.0, t))
 
+        self._syncing_slider = True
         self.pan_slider.blockSignals(True)
         self.pan_slider.setValue(int(t * 1000))
         self.pan_slider.blockSignals(False)
+        self._syncing_slider = False
 
     def _on_pan_slider(self, val: int):
+        if self._syncing_slider:
+            return
         if self._full_xmin is None or self._full_xmax is None or not self._view_width:
             return
 
         span = max(0.000001, self._full_xmax - self._full_xmin)
-        w = min(float(self._view_width), span)
+        w = float(self._view_width)
+
+        if w >= span:
+            self.plot.setXRange(self._full_xmin, self._full_xmax, padding=0.0)
+            return
 
         travel = max(0.0, span - w)
         t = float(val) / 1000.0
@@ -430,14 +432,11 @@ class SpectrumWidget(QWidget):
             x1 = self._full_xmax
             x0 = x1 - w
 
-        try:
-            self.plot.setXRange(x0, x1, padding=0.0)
-        except Exception:
-            pass
+        self.plot.setXRange(x0, x1, padding=0.0)
 
-    # =========================
-    # Canal interactivo (línea + región)
-    # =========================
+    # ----------------------------
+    # Interacción canal (verde)
+    # ----------------------------
     def _emit_tune(self, mhz: float, final: bool):
         try:
             self.sig_tune.emit(float(mhz), bool(final))
@@ -450,15 +449,15 @@ class SpectrumWidget(QWidget):
         self._sync_lock = True
         try:
             c = float(self.tune_center.value())
-            r = self.chan_region.getRegion()
-            bw = max(0.000001, float(r[1]) - float(r[0]))
+            left, right = self.chan_region.getRegion()
+            bw = max(0.000001, float(right) - float(left))
             left = c - bw / 2.0
             right = c + bw / 2.0
             self.chan_region.setRegion((left, right))
             self.tune_left.setPos(left)
             self.tune_right.setPos(right)
             self._tuned_mhz = c
-            self._emit_tune(c, False)
+            self._emit_tune(c, False)   # NO retunar hardware (MainWindow lo hace solo al final)
         except Exception:
             pass
         finally:
@@ -1131,16 +1130,13 @@ class MainWindow(QMainWindow):
 
 
     def _on_spectrum_tune(self, mhz: float, final: bool):
-        # Si escáner está corriendo, no peleamos con él
-        try:
-            if getattr(self, "scanner", None) is not None and getattr(self.scanner, "is_running", False):
-                return
-        except Exception:
-            pass
+        # si escáner corre, no pelear
+        if getattr(getattr(self, "scanner", None), "is_running", False):
+            return
 
         mhz = float(mhz)
 
-        # Actualiza spin sin disparar eventos
+        # solo actualiza UI
         try:
             self.freq_spin.blockSignals(True)
             self.freq_spin.setValue(mhz)
@@ -1148,12 +1144,9 @@ class MainWindow(QMainWindow):
         except Exception:
             pass
 
+        # SOLO al soltar aplica (evita que el espectro se mueva mientras arrastras)
         if final:
-            self._spec_tune_timer.stop()
             self._apply_tune()
-            return
-
-        self._spec_tune_timer.start()
 
 
 
