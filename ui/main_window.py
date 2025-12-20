@@ -158,165 +158,154 @@ class FrequencyNavigator(QWidget):
         self._refresh_label(center=c)
         self.sig_center_changed.emit(float(c))
 
-class SpectrumNavBar(pg.PlotWidget):
-    sig_center_changed = QtCore.Signal(float)  # center_mhz
+class SpectrumNavBar(QWidget):
+    sig_center_changed = QtCore.Signal(float, bool)  # center_mhz, final
+    sig_edge_recenter = QtCore.Signal(float)         # new_center_mhz (retune para seguir avanzando)
 
     def __init__(self, parent=None):
-        super().__init__(parent=parent)
+        super().__init__(parent)
 
-        self.setFixedHeight(46)
-        self.setBackground("#070b12")
-
-        self._full_min = None
-        self._full_max = None
-        self._span = None
+        self._xmin = None
+        self._xmax = None
         self._view_w = None
-        self._lock = False
+        self._sync = False
 
-        self.hideAxis("left")
-        self.showAxis("bottom")
-        self.showGrid(x=True, y=False, alpha=0.25)
+        self.setMinimumHeight(26)
+        self.setMaximumHeight(26)
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(0, 0, 0, 0)
 
-        ax = self.getAxis("bottom")
-        ax.setPen(pg.mkPen("#64748b", width=1))
-        ax.setTextPen(pg.mkPen("#94a3b8"))
-        try:
-            ax.setStyle(tickFont=QtGui.QFont("Segoe UI", 8))
-        except Exception:
-            pass
+        self.plot = pg.PlotWidget()
+        self.plot.setBackground("#0b1220")
+        self.plot.setMenuEnabled(False)
+        self.plot.setMouseEnabled(x=False, y=False)
 
-        self.vb = self.getViewBox()
-        self.vb.setMouseEnabled(x=False, y=False)
-        self.vb.enableAutoRange(x=False, y=False)
+        self.plot.showAxis("left", False)
+        self.plot.showAxis("right", False)
 
-        # baseline
-        self._baseline = self.plot([], [])
-        self._baseline.setPen(pg.mkPen("#111827", width=1.0))
-        self.setYRange(-1, 1, padding=0.0)
+        axB = self.plot.getAxis("bottom")
+        axB.setPen(pg.mkPen("#6b7280", width=1))
+        axB.setTextPen(pg.mkPen("#cbd5e1"))
 
-        # viewport (visible range)
-        self.view_region = pg.LinearRegionItem(
+        self.plot.showGrid(x=True, y=False, alpha=0.08)
+
+        self.vb = self.plot.getViewBox()
+        self.vb.setLimits(minXRange=0.00005)
+
+        # rectángulo de vista (la “regla”)
+        self.region = pg.LinearRegionItem(
             values=[0.0, 0.0],
             movable=True,
             swapMode="push",
-            brush=pg.mkBrush(34, 197, 94, 55),      # green-ish translucent
-            pen=pg.mkPen(34, 197, 94, 210, width=1),
+            brush=pg.mkBrush(34, 197, 94, 45),
+            pen=pg.mkPen(34, 197, 94, 190, width=1),
         )
-        self.view_region.setZValue(10)
-        self.addItem(self.view_region)
+        self.region.setZValue(10)
+        self.plot.addItem(self.region)
 
-        # dotted edges
-        self._l = pg.InfiniteLine(angle=90, movable=False, pen=pg.mkPen(34, 197, 94, 180, width=1, style=Qt.DotLine))
-        self._r = pg.InfiniteLine(angle=90, movable=False, pen=pg.mkPen(34, 197, 94, 180, width=1, style=Qt.DotLine))
-        self._l.setZValue(11)
-        self._r.setZValue(11)
-        self.addItem(self._l)
-        self.addItem(self._r)
+        self.region.sigRegionChanged.connect(self._on_region_live)
+        self.region.sigRegionChangeFinished.connect(self._on_region_final)
 
-        self.view_region.sigRegionChanged.connect(self._on_region_live)
-        self.view_region.sigRegionChangeFinished.connect(self._on_region_final)
+        lay.addWidget(self.plot)
 
-    def set_limits(self, fmin_mhz: float, fmax_mhz: float):
-        self._full_min = float(fmin_mhz)
-        self._full_max = float(fmax_mhz)
-        self._span = max(0.000001, self._full_max - self._full_min)
+        self.setStyleSheet("""
+            SpectrumNavBar {
+                border: 1px solid rgba(255,255,255,0.08);
+                border-radius: 8px;
+                background: #0b1220;
+            }
+        """)
 
-        self.vb.setLimits(
-            xMin=self._full_min,
-            xMax=self._full_max,
-            minXRange=0.00005,
-            maxXRange=self._span
-        )
-        self.setXRange(self._full_min, self._full_max, padding=0.0)
+    def set_limits(self, xmin_mhz: float, xmax_mhz: float):
+        self._xmin = float(xmin_mhz)
+        self._xmax = float(xmax_mhz)
+        self.plot.setXRange(self._xmin, self._xmax, padding=0.0)
+        self.vb.setLimits(xMin=self._xmin, xMax=self._xmax, minXRange=0.00005, maxXRange=max(0.00005, self._xmax - self._xmin))
 
+        # región por defecto si falta
+        if self._view_w is None:
+            self._view_w = max(0.0002, (self._xmax - self._xmin) * 0.20)
+
+        # asegura región válida
         try:
-            xs = np.linspace(self._full_min, self._full_max, 64, dtype=float)
-            ys = np.zeros_like(xs)
-            self._baseline.setData(xs, ys)
+            c = (self._xmin + self._xmax) / 2.0
+            self.set_view_center(c)
         except Exception:
             pass
 
-    def set_view_width(self, view_width_mhz: float):
-        self._view_w = max(0.000001, float(view_width_mhz))
+    def set_view_width(self, w_mhz: float):
+        self._view_w = max(0.00005, float(w_mhz))
+        if self._xmin is None or self._xmax is None:
+            return
+        try:
+            left, right = self.region.getRegion()
+            c = (float(left) + float(right)) / 2.0
+            self.set_view_center(c)
+        except Exception:
+            pass
 
     def set_view_center(self, center_mhz: float):
-        if self._full_min is None or self._full_max is None or self._view_w is None:
+        if self._xmin is None or self._xmax is None or self._view_w is None:
             return
-
         c = float(center_mhz)
         w = float(self._view_w)
 
-        x0 = c - w / 2.0
-        x1 = c + w / 2.0
+        left = c - w / 2.0
+        right = c + w / 2.0
 
-        # clamp inside full
-        if x0 < self._full_min:
-            x0 = self._full_min
-            x1 = x0 + w
-        if x1 > self._full_max:
-            x1 = self._full_max
-            x0 = x1 - w
+        if left < self._xmin:
+            left = self._xmin
+            right = left + w
+        if right > self._xmax:
+            right = self._xmax
+            left = right - w
 
-        self._lock = True
+        self._sync = True
         try:
-            self.view_region.blockSignals(True)
-            self.view_region.setRegion((x0, x1))
-            self.view_region.blockSignals(False)
-            self._l.setPos(x0)
-            self._r.setPos(x1)
+            self.region.setRegion((left, right))
         finally:
-            self._lock = False
+            self._sync = False
 
-    def _enforce_fixed_width(self):
-        if self._full_min is None or self._full_max is None or self._view_w is None:
-            return None
-
-        x0, x1 = self.view_region.getRegion()
-        x0 = float(x0); x1 = float(x1)
-        if x1 < x0:
-            x0, x1 = x1, x0
-
-        w = float(self._view_w)
-        c = (x0 + x1) / 2.0
-
-        nx0 = c - w / 2.0
-        nx1 = c + w / 2.0
-
-        # clamp inside full
-        if nx0 < self._full_min:
-            nx0 = self._full_min
-            nx1 = nx0 + w
-        if nx1 > self._full_max:
-            nx1 = self._full_max
-            nx0 = nx1 - w
-
-        self._lock = True
+    def _emit_center(self, final: bool):
+        if self._xmin is None or self._xmax is None:
+            return
         try:
-            self.view_region.blockSignals(True)
-            self.view_region.setRegion((nx0, nx1))
-            self.view_region.blockSignals(False)
-        finally:
-            self._lock = False
-
-        self._l.setPos(nx0)
-        self._r.setPos(nx1)
-        return (nx0 + nx1) / 2.0
+            left, right = self.region.getRegion()
+            c = (float(left) + float(right)) / 2.0
+            self.sig_center_changed.emit(float(c), bool(final))
+        except Exception:
+            pass
 
     def _on_region_live(self):
-        if self._lock:
+        if self._sync:
             return
-        c = self._enforce_fixed_width()
-        if c is None:
-            return
-        self.sig_center_changed.emit(float(c))
+        self._emit_center(False)
 
     def _on_region_final(self):
-        if self._lock:
+        if self._sync:
             return
-        c = self._enforce_fixed_width()
-        if c is None:
-            return
-        self.sig_center_changed.emit(float(c))
+
+        # si llega a un borde, pedimos “re-centrar” retuneando el span
+        try:
+            left, right = self.region.getRegion()
+            left = float(left); right = float(right)
+            w = max(0.00005, right - left)
+            margin = max(w * 0.10, 0.00010)
+
+            hit_left = (left <= (self._xmin + margin))
+            hit_right = (right >= (self._xmax - margin))
+
+            self._emit_center(True)
+
+            if hit_left:
+                # mueve el “span” hacia abajo para que el rect quede centrado
+                new_center = (left + right) / 2.0 - (w * 0.60)
+                self.sig_edge_recenter.emit(float(new_center))
+            elif hit_right:
+                new_center = (left + right) / 2.0 + (w * 0.60)
+                self.sig_edge_recenter.emit(float(new_center))
+        except Exception:
+            pass
 
 
 
@@ -515,9 +504,10 @@ class SpectrumWidget(QWidget):
 
 
     # navbar -> centra la vista
-    def _on_nav_center(self, center_mhz: float):
+    def _on_nav_center(self, center_mhz: float, final: bool):
         if self._full_xmin is None or self._full_xmax is None:
             return
+
         try:
             (xr, _yr) = self.plot.viewRange()
             w = max(0.000001, float(xr[1]) - float(xr[0]))
@@ -528,6 +518,7 @@ class SpectrumWidget(QWidget):
         x0 = c - w / 2.0
         x1 = c + w / 2.0
 
+        # clamp
         if x0 < self._full_xmin:
             x0 = self._full_xmin
             x1 = x0 + w
@@ -540,6 +531,10 @@ class SpectrumWidget(QWidget):
             self.plot.setXRange(x0, x1, padding=0.0)
         finally:
             self._syncing_navbar = False
+
+        self._freeze_spectrum_live = True
+        self._last_draw_x = None
+        self._last_draw_y = None
 
     def _on_view_range_changed(self, *_):
         
@@ -670,7 +665,13 @@ class SpectrumWidget(QWidget):
             self._avg = a * y + (1.0 - a) * self._avg
             self._avg = a * self._avg + (1.0 - a) * np.roll(self._avg, 1)
 
-        self.avg_curve.setData(x, self._avg)
+        if getattr(self, "_freeze_spectrum_live", False) and getattr(self, "_drag_tuning", False):
+            if self._last_draw_x is not None and self._last_draw_y is not None:
+                self.avg_curve.setData(self._last_draw_x, self._last_draw_y)
+        else:
+            self.avg_curve.setData(x, self._avg)
+            self._last_draw_x = x.copy()
+            self._last_draw_y = self._avg.copy()
 
         try:
             vv = self._avg[np.isfinite(self._avg)]
@@ -754,6 +755,8 @@ class SpectrumWidget(QWidget):
             pass
 
     def _on_center_changed_live(self):
+        if getattr(self, "_freeze_spectrum_live", False):
+            pass
         if self._sync_lock:
             return
         self._sync_lock = True
@@ -781,7 +784,11 @@ class SpectrumWidget(QWidget):
         except Exception:
             pass
 
+        self._drag_tuning = False
+
     def _on_region_changed_live(self):
+        if getattr(self, "_freeze_spectrum_live", False):
+            pass
         if self._sync_lock:
             return
         self._sync_lock = True
@@ -1024,6 +1031,9 @@ class MainWindow(QMainWindow):
        
 
         self.spectrum = SpectrumWidget()
+
+        self.spectrum.navbar.sig_center_changed.connect(self.spectrum._on_nav_center)
+        self.spectrum.navbar.sig_edge_recenter.connect(self._on_nav_edge_recenter)
 
                 # =========================
         # Dial manual desde espectro
@@ -1451,24 +1461,54 @@ class MainWindow(QMainWindow):
 
 
     def _on_spectrum_tune(self, mhz: float, final: bool):
-        # si escáner corre, no pelear
-        if getattr(getattr(self, "scanner", None), "is_running", False):
+        # LIVE: solo mueve marcador + actualiza UI (NO retunea driver)
+        if not final:
+            try:
+                if hasattr(self, "freq_spin") and self.freq_spin is not None:
+                    if not self.freq_spin.hasFocus() and not self.freq_spin.lineEdit().hasFocus():
+                        self.freq_spin.blockSignals(True)
+                        self.freq_spin.setValue(float(mhz))
+                        self.freq_spin.blockSignals(False)
+            except Exception:
+                pass
+            try:
+                self.spectrum.set_tuned_freq_mhz(float(mhz))
+            except Exception:
+                pass
             return
 
-        mhz = float(mhz)
-
-        # solo actualiza UI
+        # FINAL: aquí sí retune real
         try:
             self.freq_spin.blockSignals(True)
-            self.freq_spin.setValue(mhz)
+            self.freq_spin.setValue(float(mhz))
             self.freq_spin.blockSignals(False)
         except Exception:
             pass
 
-        # SOLO al soltar aplica (evita que el espectro se mueva mientras arrastras)
-        if final:
-            self._apply_tune()
+        try:
+            if self.active_driver is not None and hasattr(self.active_driver, "set_center_freq"):
+                self.active_driver.set_center_freq(float(mhz) * 1e6)
+        except Exception:
+            pass
 
+        
+    def _on_nav_edge_recenter(self, new_center_mhz: float):
+        # retune para “correr” el span y que el rectángulo quede centrado
+        try:
+            if self.active_driver is not None and hasattr(self.active_driver, "set_center_freq"):
+                self.active_driver.set_center_freq(float(new_center_mhz) * 1e6)
+        except Exception:
+            pass
+
+        try:
+            # mantiene el dial coherente
+            if hasattr(self, "freq_spin") and self.freq_spin is not None:
+                if not self.freq_spin.hasFocus() and not self.freq_spin.lineEdit().hasFocus():
+                    self.freq_spin.blockSignals(True)
+                    self.freq_spin.setValue(float(new_center_mhz))
+                    self.freq_spin.blockSignals(False)
+        except Exception:
+            pass
 
 
 
