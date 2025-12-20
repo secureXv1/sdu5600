@@ -379,12 +379,14 @@ class SpectrumWidget(QWidget):
         axR.setLabel("dBm")
 
         # Ticks dB (cada 5 dB, -40 arriba a -130 abajo)
-        self._ymin = -130.0
-        self._ymax = -40.0
+        self._ymin = -160.0
+        self._ymax = -45.0
+        
         self.plot.setYRange(self._ymin, self._ymax, padding=0.0)
+        
 
         def _db_ticks():
-            vals = list(range(-130, -39, 5))
+            vals = list(range(-176, -44, 5))
             return [(v, f"{v} dBm") for v in vals]
 
         axL.setTicks([_db_ticks()])
@@ -409,14 +411,22 @@ class SpectrumWidget(QWidget):
         self.avg_curve.setPen(pg.mkPen("#e5e7eb", width=1.2))
 
         # relleno azul (como SDR Control)
-        self.avg_curve.setFillLevel(self._ymin)
+        self.avg_curve.setFillLevel(-140.0)
         grad = QLinearGradient(0, self._ymin, 0, self._ymax)
         grad.setColorAt(0.0, QColor(12, 25, 60, 210))
         grad.setColorAt(1.0, QColor(65, 105, 180, 80))
         self.avg_curve.setBrush(QBrush(grad))
 
-        self.peak_curve = self.plot.plot([], [])
-        self.peak_curve.setPen(pg.mkPen(QColor(210, 210, 210, 170), width=1.0))
+        # POR ESTE (piso real = self._ymin):
+
+        self.avg_curve = self.plot.plot([], [])
+        self.avg_curve.setPen(pg.mkPen("#e5e7eb", width=1.2))
+
+        self.avg_curve.setFillLevel(self._ymin)
+        grad = QLinearGradient(0, self._ymin, 0, self._ymax)
+        grad.setColorAt(0.0, QColor(12, 25, 60, 210))
+        grad.setColorAt(1.0, QColor(65, 105, 180, 80))
+        self.avg_curve.setBrush(QBrush(grad))
 
         # ======================
         # Marcador verde (3 líneas)
@@ -465,8 +475,8 @@ class SpectrumWidget(QWidget):
         # ======================
         self._avg = None
         self._peak = None
-        self._avg_alpha = 0.22          # “natural”
-        self._peak_decay_db = 0.35      # decaimiento por frame (dB)
+        self._avg_alpha = 0.08          # “natural”
+        #self._peak_decay_db = 0.35      # decaimiento por frame (dB)
 
         # X range tracking
         self._full_xmin = None
@@ -494,6 +504,10 @@ class SpectrumWidget(QWidget):
         self.vb.sigRangeChanged.connect(self._on_view_range_changed)
 
         self.plot.setMinimumHeight(180)
+
+        self._ylow = float(self._ymin)
+        self._yhigh = float(self._ymax)
+        self._yr_alpha = 0.12   # suavizado del auto-range (0.05..0.20)
 
     # ----------------------------
     # Helpers / Layout overlay
@@ -633,39 +647,65 @@ class SpectrumWidget(QWidget):
     # ----------------------------
     # Update spectrum (AVG + PEAK)
     # ----------------------------
+
+
     def update_spectrum(self, freqs_hz, levels_db, tuned_mhz: float | None = None):
         if freqs_hz is None or len(freqs_hz) == 0:
             return
 
         freqs_mhz = (freqs_hz / 1e6) if hasattr(freqs_hz, "__array__") else [f / 1e6 for f in freqs_hz]
+        x = np.asarray(freqs_mhz, dtype=np.float32)
         y = np.asarray(levels_db, dtype=np.float32)
 
-        # init
+        m = np.isfinite(x) & np.isfinite(y)
+        x = x[m]; y = y[m]
+        if x.size == 0:
+            return
+
+        # init / EMA (SIEMPRE)
         if self._avg is None or self._avg.shape != y.shape:
             self._avg = y.copy()
-            self._peak = y.copy()
         else:
             a = float(self._avg_alpha)
             self._avg = a * y + (1.0 - a) * self._avg
+            self._avg = a * self._avg + (1.0 - a) * np.roll(self._avg, 1)
 
-            # peak-hold con decaimiento (dB)
-            decay = float(self._peak_decay_db)
-            self._peak = np.maximum(self._peak - decay, y)
+        self.avg_curve.setData(x, self._avg)
 
-            x = np.asarray(freqs_mhz, dtype=np.float32)
-            y_avg = np.asarray(self._avg, dtype=np.float32)
-            y_pk  = np.asarray(self._peak, dtype=np.float32)
+        try:
+            vv = self._avg[np.isfinite(self._avg)]
+            if vv.size > 16:
+                p10 = float(np.percentile(vv, 10.0))
+                p995 = float(np.percentile(vv, 99.5))
 
-            m = np.isfinite(x) & np.isfinite(y_avg) & np.isfinite(y_pk)
-            x = x[m]; y_avg = y_avg[m]; y_pk = y_pk[m]
+                target_low = p10 - 5.0   # piso más abajo
+                target_high = p995 + 10.0  # aire arriba
 
-            self.avg_curve.setData(x, y_avg)
-            self.peak_curve.setData(x, y_pk)
+                # límites razonables
+                target_low = max(-190.0, min(-80.0, target_low))
+                target_high = max(-120.0, min(-20.0, target_high))
+
+                # evita invertir
+                if target_high - target_low < 40.0:
+                    target_low = target_high - 40.0
+
+                a = float(self._yr_alpha)
+                self._ylow = (1.0 - a) * self._ylow + a * target_low
+                self._yhigh = (1.0 - a) * self._yhigh + a * target_high
+
+                self.plot.setYRange(self._ylow, self._yhigh, padding=0.0)
+
+                # relleno siempre desde el piso actual
+                try:
+                    self.avg_curve.setFillLevel(self._ylow)
+                except Exception:
+                    pass
+        except Exception:
+            pass
 
         # rango X completo
         try:
-            xmin = float(freqs_mhz[0])
-            xmax = float(freqs_mhz[-1])
+            xmin = float(x[0]); xmax = float(x[-1])
             if xmax < xmin:
                 xmin, xmax = xmax, xmin
         except Exception:
@@ -686,10 +726,10 @@ class SpectrumWidget(QWidget):
             self.plot.setXRange(self._full_xmin, self._full_xmax, padding=0.0)
             self._x_inited = True
 
-        # info discreto (como el badge “Freq/Span” del screenshot)
+        # info discreto
         try:
-            start = float(freqs_mhz[0])
-            end = float(freqs_mhz[-1])
+            start = float(xmin)
+            end = float(xmax)
             center = (start + end) / 2.0
             span = end - start
             tuned_txt = f" | Tuned: {tuned_mhz:.6f} MHz" if tuned_mhz is not None else ""
@@ -699,12 +739,9 @@ class SpectrumWidget(QWidget):
         except Exception:
             pass
 
-       
-
         if tuned_mhz is not None:
             self.set_tuned_freq_mhz(tuned_mhz)
 
-        # sync navbar
         self._on_view_range_changed()
 
     # ----------------------------
@@ -782,8 +819,9 @@ class SpectrumWidget(QWidget):
             axL = self.plot.getAxis("left")
             axR = self.plot.getAxis("right")
 
+
             def _db_ticks():
-                vals = list(range(int(self._ymin), int(self._ymax) + 1, 5))
+                vals = list(range(-140, -44, 5))
                 return [(v, f"{v} dBm") for v in vals]
 
             axL.setTicks([_db_ticks()])
@@ -1912,11 +1950,7 @@ class MainWindow(QMainWindow):
             pass
 
         
-        try:
-            self.spectrum.set_fixed_dbm_range(-130.0, -40.0)
-        except Exception:
-            pass
-
+       
         # -------------------------------------------------
         # 4) Waterfall: usa levels_raw (como ya te funciona)
         # -------------------------------------------------
