@@ -1,3 +1,4 @@
+# ui/waterfall_widget.py
 from __future__ import annotations
 
 from PySide6.QtWidgets import QWidget, QVBoxLayout
@@ -9,16 +10,12 @@ import numpy as np
 
 class WaterfallWidget(QWidget):
     """
-    Waterfall estilo SDR Console (contraste agradable y marcador claro).
-
-    API:
-      wf.append_line(levels_db)
-      wf.set_reverse(True/False)
-      wf.set_levels(min_db, max_db)
-      wf.clear()
-      wf.set_freq_axis(start_hz, stop_hz)
-      wf.set_tuned_freq(hz)
-      wf.set_mode(mode)   # para ajustar ancho (opcional)
+    Waterfall estilo SDR Control:
+    - Colormap tipo SDR (CET-L9)
+    - Auto-contrast (AGC visual) con toggle "Auto"
+    - Barra lateral de escala (HistogramLUTItem) como en SDR
+    - Marcador verde 3 líneas
+    - Click/drag para sintonizar
     """
     sig_tune = QtCore.Signal(float, bool)
 
@@ -36,15 +33,14 @@ class WaterfallWidget(QWidget):
 
         self.history_lines = int(history_lines)
         self.width = int(default_width)
-
         self.reverse = False
 
-        # ✅ niveles SDR-like (HackRF suele verse mejor así)
-        self.levels = (-125.0, -35.0)
+        # niveles SDR-like
+        self.levels = (-130.0, -40.0)
 
         # Auto-contrast suave (visual AGC)
         self.auto_contrast = True
-        self._contrast_alpha = 0.08  # 0.05–0.12 recomendable
+        self._contrast_alpha = 0.08
         self._levels_smooth = list(self.levels)
 
         self.img = np.full((self.history_lines, self.width), self.levels[0], dtype=np.float32)
@@ -52,18 +48,19 @@ class WaterfallWidget(QWidget):
         layout = QVBoxLayout(self)
         layout.setContentsMargins(8, 0, 8, 8)
 
+        # Layout gráfico con barra lateral LUT
         self.view = pg.GraphicsLayoutWidget()
-        self.plot = self.view.addPlot()
+
+        self.plot = self.view.addPlot(row=0, col=0)
+
         self.plot.setMouseEnabled(x=True, y=False)
-        self.plot.showGrid(x=True, y=False, alpha=0.15)
+        self.plot.showGrid(x=True, y=False, alpha=0.12)
 
-        # X axis MHz
         self.plot.showAxis("bottom")
-        self.plot.setLabel("bottom", "Frecuencia", units="MHz")
-        self.plot.getAxis("bottom").setTextPen(pg.mkPen("#9ca3af"))
-        self.plot.getAxis("bottom").setPen(pg.mkPen("#374151"))
+        self.plot.setLabel("bottom", "", units=None)
+        self.plot.getAxis("bottom").setTextPen(pg.mkPen("#cbd5e1"))
+        self.plot.getAxis("bottom").setPen(pg.mkPen("#6b7280"))
 
-        # Y axis oculto (tiempo)
         self.plot.hideAxis("left")
 
         # ImageItem
@@ -71,21 +68,18 @@ class WaterfallWidget(QWidget):
         self.img_item.setOpts(axisOrder="row-major")
         self.plot.addItem(self.img_item)
 
-        self._drag_tuning = False
-
-        # Captura mouse de la escena de pyqtgraph
-        self.plot.scene().sigMouseClicked.connect(self._on_scene_mouse_clicked)
-        self.plot.scene().sigMouseMoved.connect(self._on_scene_mouse_moved)
-
         # Colormap SDR-like
-        # CET-L9: azules/negros tipo SDR (muy bonito)
         try:
             cmap = pg.colormap.get("CET-L9")
         except Exception:
             cmap = pg.colormap.get("viridis")
 
-        self.img_item.setLookupTable(cmap.getLookupTable(0.0, 1.0, 256))
+        self._lut = cmap.getLookupTable(0.0, 1.0, 256)
+        self.img_item.setLookupTable(self._lut)
         self.img_item.setImage(self.img, autoLevels=False, levels=self.levels)
+
+                
+
         layout.addWidget(self.view)
 
         # freq mapping
@@ -97,25 +91,28 @@ class WaterfallWidget(QWidget):
         self._mode = "NFM"
         self._tuned_hz = None
 
-        # Tune lines: izquierda/centro/derecha (como SDR)
-        self.tune_left = pg.InfiniteLine(angle=90, movable=False, pen=pg.mkPen("#22c55e", width=1.2))
+        # Tune lines: izquierda/centro/derecha
+        self.tune_left = pg.InfiniteLine(angle=90, movable=False, pen=pg.mkPen("#22c55e", width=1.1))
         self.tune_center = pg.InfiniteLine(angle=90, movable=False, pen=pg.mkPen("#22c55e", width=2.0))
-        self.tune_right = pg.InfiniteLine(angle=90, movable=False, pen=pg.mkPen("#22c55e", width=1.2))
+        self.tune_right = pg.InfiniteLine(angle=90, movable=False, pen=pg.mkPen("#22c55e", width=1.1))
         self.plot.addItem(self.tune_left)
         self.plot.addItem(self.tune_center)
         self.plot.addItem(self.tune_right)
 
-        # “Cuadro” centrado con frecuencia (badge)
+        # Badge inferior-centro (Freq/Span)
         self.center_box = pg.TextItem(color="#e5e7eb", anchor=(0.5, 0.5))
         self.center_box.setZValue(10)
         self.plot.addItem(self.center_box)
-
         self.center_box.setHtml(
             "<div style='background:rgba(2,6,23,0.80);"
-            "border:1px solid rgba(34,197,94,0.60);"
+            "border:1px solid rgba(34,197,94,0.55);"
             "border-radius:10px;padding:7px 12px;"
-            "font-weight:800;letter-spacing:0.3px;'>—</div>"
+            "font-weight:900;letter-spacing:0.3px;'>—</div>"
         )
+
+        self._drag_tuning = False
+        self.plot.scene().sigMouseClicked.connect(self._on_scene_mouse_clicked)
+        self.plot.scene().sigMouseMoved.connect(self._on_scene_mouse_moved)
 
         self._apply_rect()
 
@@ -126,7 +123,6 @@ class WaterfallWidget(QWidget):
         return float(self.MODE_BW_HZ.get(self._mode, 12_500))
 
     def _apply_rect(self):
-        # rect en MHz
         self.img_item.setRect(
             QtCore.QRectF(
                 self._f_start_hz / 1e6,
@@ -151,16 +147,12 @@ class WaterfallWidget(QWidget):
         self.tune_center.setPos(center)
         self.tune_right.setPos(right)
 
-        # badge al centro del span visible, cerca al “bottom”
         x_center_mhz = ((self._f_start_hz + self._f_stop_hz) / 2.0) / 1e6
-        self.center_box.setPos(x_center_mhz, self.history_lines * 0.80)
+        self.center_box.setPos(x_center_mhz, self.history_lines * 0.82)
 
     def _auto_levels_from_line(self, arr: np.ndarray):
-        # AGC visual: calcula percentiles para buen contraste sin “quemar” señales
         lo = float(np.percentile(arr, 8))
         hi = float(np.percentile(arr, 98))
-
-        # evitar rango demasiado pequeño
         if hi - lo < 15:
             hi = lo + 15
 
@@ -168,7 +160,6 @@ class WaterfallWidget(QWidget):
         self._levels_smooth[0] = (1 - a) * self._levels_smooth[0] + a * lo
         self._levels_smooth[1] = (1 - a) * self._levels_smooth[1] + a * hi
 
-        # clamp razonable
         self._levels_smooth[0] = max(-160.0, min(-20.0, self._levels_smooth[0]))
         self._levels_smooth[1] = max(-160.0, min(-10.0, self._levels_smooth[1]))
 
@@ -190,6 +181,8 @@ class WaterfallWidget(QWidget):
         self._mode = (mode or "").upper().strip() or "NFM"
         self._update_marker()
 
+    def set_auto(self, on: bool):
+        self.auto_contrast = bool(on)
     # ----------------------------
     # API pública
     # ----------------------------
@@ -198,13 +191,11 @@ class WaterfallWidget(QWidget):
         if arr.size == 0:
             return
 
-        # resize si cambia FFT
         if arr.size != self.width:
             self.width = int(arr.size)
             self.img = np.full((self.history_lines, self.width), self.levels[0], dtype=np.float32)
             self._rect_dirty = True
 
-        # Auto-contrast suave
         if self.auto_contrast:
             try:
                 self._auto_levels_from_line(arr)
@@ -218,7 +209,6 @@ class WaterfallWidget(QWidget):
             self.img[1:, :] = self.img[:-1, :]
             self.img[0, :] = arr
 
-        # aplicar rect solo si hace falta (más performance)
         if self._rect_dirty:
             try:
                 self._apply_rect()
@@ -226,8 +216,6 @@ class WaterfallWidget(QWidget):
                 pass
 
         self.img_item.setImage(self.img, autoLevels=False, levels=self.levels)
-
-        # marcador/badge
         self._update_marker()
 
     def clear(self):
@@ -246,17 +234,17 @@ class WaterfallWidget(QWidget):
         self._update_marker()
 
         mhz = self._tuned_hz / 1e6
+        span_khz = abs(self._f_stop_hz - self._f_start_hz) / 1000.0
         self.center_box.setHtml(
             "<div style='background:rgba(2,6,23,0.80);"
-            "border:1px solid rgba(34,197,94,0.60);"
+            "border:1px solid rgba(34,197,94,0.55);"
             "border-radius:10px;padding:7px 12px;"
-            "font-weight:900;letter-spacing:0.4px;'>"
-            f"{mhz:.6f} MHz"
+            "font-weight:900;letter-spacing:0.35px;'>"
+            f"Freq: {mhz:.6f} MHz<br/>Span: ±{span_khz/2.0:.0f} kHz"
             "</div>"
         )
 
-    
-        # ----------------------------
+    # ----------------------------
     # Dial manual (mouse)
     # ----------------------------
     def _mhz_from_scene_pos(self, scene_pos) -> float | None:
@@ -267,7 +255,6 @@ class WaterfallWidget(QWidget):
         except Exception:
             return None
 
-        # clamp al rango del waterfall
         try:
             xmin = float(self._f_start_hz) / 1e6
             xmax = float(self._f_stop_hz) / 1e6
@@ -280,7 +267,6 @@ class WaterfallWidget(QWidget):
         return x_mhz
 
     def _on_scene_mouse_clicked(self, ev):
-        # Click izquierdo activa dial; al soltar aplica final=True
         try:
             if ev.button() != Qt.LeftButton:
                 return
@@ -291,13 +277,9 @@ class WaterfallWidget(QWidget):
         mhz = self._mhz_from_scene_pos(scene_pos)
         if mhz is None:
             return
-
-        # Si viene un click "normal", lo tratamos como: comenzar tuning + final inmediato
-        # (pero si quieres SOLO con drag, comenta esta línea y deja solo drag)
         self.sig_tune.emit(float(mhz), True)
 
     def _on_scene_mouse_moved(self, scene_pos):
-        # Solo sintoniza mientras el botón izquierdo esté presionado (drag)
         try:
             buttons = QtCore.QCoreApplication.mouseButtons()
             if not (buttons & Qt.LeftButton):
@@ -311,6 +293,7 @@ class WaterfallWidget(QWidget):
             return
 
         self._drag_tuning = True
-        # final=False mientras arrastras (throttle lo hace MainWindow)
         self.sig_tune.emit(float(mhz), False)
+
+
 

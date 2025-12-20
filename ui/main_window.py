@@ -23,11 +23,16 @@ import re
 import math
 from PySide6.QtWidgets import QToolButton, QMenu, QSlider
 from PySide6.QtCore import QEvent
+from PySide6 import QtGui
+from ui.band_bar import BandBar
+from PySide6 import QtWidgets
+from ui.waterfall_widget import WaterfallWidget
+
+
 
 
 from core.radio_manager import RadioManager
 from .radio_card import RadioCard
-from .waterfall_widget import WaterfallWidget
 from drivers.hackrf_driver import HackRFDriver
 from core.banks_store import BanksStore
 from core.scanner_engine import ScannerEngine
@@ -61,7 +66,274 @@ class RibbonBar(QWidget):
         """)
 
 
+class FrequencyNavigator(QWidget):
+    sig_center_changed = QtCore.Signal(float)  # center_mhz
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._full_min = None
+        self._full_max = None
+        self._view_w = None
+        self._block = False
+
+        self.lbl = QLabel("Rango: --  |  Vista: --  |  Centro: --")
+        self.lbl.setStyleSheet("color:#cbd5e1; font-size:11px;")
+
+        self.slider = QSlider(Qt.Horizontal)
+        self.slider.setRange(0, 1000)
+        self.slider.setValue(500)
+        self.slider.setSingleStep(1)
+        self.slider.setPageStep(25)
+        self.slider.setMinimumHeight(18)
+        self.slider.valueChanged.connect(self._on_change)
+
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(0, 0, 0, 0)
+        lay.setSpacing(2)
+        lay.addWidget(self.lbl)
+        lay.addWidget(self.slider)
+
+    def set_limits(self, full_min_mhz: float, full_max_mhz: float):
+        self._full_min = float(full_min_mhz)
+        self._full_max = float(full_max_mhz)
+        self._refresh_label()
+
+    def set_view_width(self, view_width_mhz: float):
+        self._view_w = max(0.000001, float(view_width_mhz))
+        self._refresh_label()
+
+    def set_center(self, center_mhz: float):
+        if self._full_min is None or self._full_max is None:
+            return
+        span = max(0.000001, self._full_max - self._full_min)
+        c = float(center_mhz)
+
+        # clamp center dentro del rango
+        c = max(self._full_min, min(self._full_max, c))
+
+        # thumb representa el CENTRO (siempre “centrado” conceptualmente)
+        t = (c - self._full_min) / span
+        t = max(0.0, min(1.0, t))
+
+        self._block = True
+        self.slider.blockSignals(True)
+        self.slider.setValue(int(t * 1000))
+        self.slider.blockSignals(False)
+        self._block = False
+
+        self._refresh_label(center=c)
+
+    def _refresh_label(self, center=None):
+        if self._full_min is None or self._full_max is None or self._view_w is None:
+            return
+        span = self._full_max - self._full_min
+        c = center
+        if c is None:
+            c = self._full_min + (self.slider.value() / 1000.0) * max(0.000001, span)
+
+        v0 = c - self._view_w / 2.0
+        v1 = c + self._view_w / 2.0
+
+        # clamp vista dentro del rango total
+        if v0 < self._full_min:
+            v0 = self._full_min
+            v1 = v0 + self._view_w
+        if v1 > self._full_max:
+            v1 = self._full_max
+            v0 = v1 - self._view_w
+
+        self.lbl.setText(
+            f"Rango: {self._full_min:.6f} – {self._full_max:.6f} MHz   |   "
+            f"Vista: {v0:.6f} – {v1:.6f} MHz   |   Centro: {((v0+v1)/2.0):.6f} MHz"
+        )
+
+    def _on_change(self, val: int):
+        if self._block:
+            return
+        if self._full_min is None or self._full_max is None:
+            return
+        span = max(0.000001, self._full_max - self._full_min)
+        t = float(val) / 1000.0
+        c = self._full_min + t * span
+        self._refresh_label(center=c)
+        self.sig_center_changed.emit(float(c))
+
+class SpectrumNavBar(pg.PlotWidget):
+    sig_center_changed = QtCore.Signal(float)  # center_mhz
+
+    def __init__(self, parent=None):
+        super().__init__(parent=parent)
+
+        self.setFixedHeight(46)
+        self.setBackground("#070b12")
+
+        self._full_min = None
+        self._full_max = None
+        self._span = None
+        self._view_w = None
+        self._lock = False
+
+        self.hideAxis("left")
+        self.showAxis("bottom")
+        self.showGrid(x=True, y=False, alpha=0.25)
+
+        ax = self.getAxis("bottom")
+        ax.setPen(pg.mkPen("#64748b", width=1))
+        ax.setTextPen(pg.mkPen("#94a3b8"))
+        try:
+            ax.setStyle(tickFont=QtGui.QFont("Segoe UI", 8))
+        except Exception:
+            pass
+
+        self.vb = self.getViewBox()
+        self.vb.setMouseEnabled(x=False, y=False)
+        self.vb.enableAutoRange(x=False, y=False)
+
+        # baseline
+        self._baseline = self.plot([], [])
+        self._baseline.setPen(pg.mkPen("#111827", width=1.0))
+        self.setYRange(-1, 1, padding=0.0)
+
+        # viewport (visible range)
+        self.view_region = pg.LinearRegionItem(
+            values=[0.0, 0.0],
+            movable=True,
+            swapMode="push",
+            brush=pg.mkBrush(34, 197, 94, 55),      # green-ish translucent
+            pen=pg.mkPen(34, 197, 94, 210, width=1),
+        )
+        self.view_region.setZValue(10)
+        self.addItem(self.view_region)
+
+        # dotted edges
+        self._l = pg.InfiniteLine(angle=90, movable=False, pen=pg.mkPen(34, 197, 94, 180, width=1, style=Qt.DotLine))
+        self._r = pg.InfiniteLine(angle=90, movable=False, pen=pg.mkPen(34, 197, 94, 180, width=1, style=Qt.DotLine))
+        self._l.setZValue(11)
+        self._r.setZValue(11)
+        self.addItem(self._l)
+        self.addItem(self._r)
+
+        self.view_region.sigRegionChanged.connect(self._on_region_live)
+        self.view_region.sigRegionChangeFinished.connect(self._on_region_final)
+
+    def set_limits(self, fmin_mhz: float, fmax_mhz: float):
+        self._full_min = float(fmin_mhz)
+        self._full_max = float(fmax_mhz)
+        self._span = max(0.000001, self._full_max - self._full_min)
+
+        self.vb.setLimits(
+            xMin=self._full_min,
+            xMax=self._full_max,
+            minXRange=0.00005,
+            maxXRange=self._span
+        )
+        self.setXRange(self._full_min, self._full_max, padding=0.0)
+
+        try:
+            xs = np.linspace(self._full_min, self._full_max, 64, dtype=float)
+            ys = np.zeros_like(xs)
+            self._baseline.setData(xs, ys)
+        except Exception:
+            pass
+
+    def set_view_width(self, view_width_mhz: float):
+        self._view_w = max(0.000001, float(view_width_mhz))
+
+    def set_view_center(self, center_mhz: float):
+        if self._full_min is None or self._full_max is None or self._view_w is None:
+            return
+
+        c = float(center_mhz)
+        w = float(self._view_w)
+
+        x0 = c - w / 2.0
+        x1 = c + w / 2.0
+
+        # clamp inside full
+        if x0 < self._full_min:
+            x0 = self._full_min
+            x1 = x0 + w
+        if x1 > self._full_max:
+            x1 = self._full_max
+            x0 = x1 - w
+
+        self._lock = True
+        try:
+            self.view_region.blockSignals(True)
+            self.view_region.setRegion((x0, x1))
+            self.view_region.blockSignals(False)
+            self._l.setPos(x0)
+            self._r.setPos(x1)
+        finally:
+            self._lock = False
+
+    def _enforce_fixed_width(self):
+        if self._full_min is None or self._full_max is None or self._view_w is None:
+            return None
+
+        x0, x1 = self.view_region.getRegion()
+        x0 = float(x0); x1 = float(x1)
+        if x1 < x0:
+            x0, x1 = x1, x0
+
+        w = float(self._view_w)
+        c = (x0 + x1) / 2.0
+
+        nx0 = c - w / 2.0
+        nx1 = c + w / 2.0
+
+        # clamp inside full
+        if nx0 < self._full_min:
+            nx0 = self._full_min
+            nx1 = nx0 + w
+        if nx1 > self._full_max:
+            nx1 = self._full_max
+            nx0 = nx1 - w
+
+        self._lock = True
+        try:
+            self.view_region.blockSignals(True)
+            self.view_region.setRegion((nx0, nx1))
+            self.view_region.blockSignals(False)
+        finally:
+            self._lock = False
+
+        self._l.setPos(nx0)
+        self._r.setPos(nx1)
+        return (nx0 + nx1) / 2.0
+
+    def _on_region_live(self):
+        if self._lock:
+            return
+        c = self._enforce_fixed_width()
+        if c is None:
+            return
+        self.sig_center_changed.emit(float(c))
+
+    def _on_region_final(self):
+        if self._lock:
+            return
+        c = self._enforce_fixed_width()
+        if c is None:
+            return
+        self.sig_center_changed.emit(float(c))
+
+
+
+
+
+
+
 class SpectrumWidget(QWidget):
+    """
+    Spectrum estilo SDR Control V3:
+    - Trazo blanco + relleno azul
+    - Promedio suave + Peak Hold (identificar señales fácil)
+    - Eje dBm a izquierda y derecha
+    - Grid horizontal marcado
+    - S-Meter overlay (top-left)
+    - Barra mini-map inferior (tu navbar) se mantiene
+    """
     sig_tune = QtCore.Signal(float, bool)  # mhz, final
 
     MODE_BW_HZ = {
@@ -77,60 +349,93 @@ class SpectrumWidget(QWidget):
         super().__init__(parent)
         v = QVBoxLayout(self)
         v.setContentsMargins(8, 8, 8, 8)
+        v.setSpacing(6)
 
+        # ======================
+        # Plot principal
+        # ======================
         self.plot = pg.PlotWidget()
-        self.plot.setBackground("#020617")
-        self.plot.showGrid(x=True, y=True, alpha=0.15)
-        self.plot.setLabel("bottom", "Frecuencia", units="MHz")
-        self.plot.setLabel("left", "Nivel", units="dB")
+        self.plot.setBackground("#05070b")
+        self.plot.setMenuEnabled(False)
+        self.plot.setMouseEnabled(x=True, y=False)
+        self.plot.getViewBox().enableAutoRange(x=False, y=False)
+
+        # Grid estilo SDR (mucho horizontal, poco vertical)
+        self.plot.showGrid(x=True, y=True, alpha=0.10)
+
+        # Ejes
+        axL = self.plot.getAxis("left")
+        axB = self.plot.getAxis("bottom")
+        axR = self.plot.getAxis("right")
+
+        self.plot.showAxis("right")
+
+        for ax in (axL, axR, axB):
+            ax.setPen(pg.mkPen("#6b7280", width=1))
+            ax.setTextPen(pg.mkPen("#cbd5e1"))
+
+        # Etiquetas (como screenshot: dBm en vertical)
+        axL.setLabel("dBm")
+        axR.setLabel("dBm")
+
+        # Ticks dB (cada 5 dB, -40 arriba a -130 abajo)
+        self._ymin = -130.0
+        self._ymax = -40.0
+        self.plot.setYRange(self._ymin, self._ymax, padding=0.0)
+
+        def _db_ticks():
+            vals = list(range(-130, -39, 5))
+            return [(v, f"{v} dBm") for v in vals]
+
+        axL.setTicks([_db_ticks()])
+        axR.setTicks([_db_ticks()])
+
+        # Bottom: MHz (limpio)
+        axB.setLabel("")  # SDR Control casi no pone label grande
+        try:
+            axB.setStyle(tickFont=QtGui.QFont("Segoe UI", 8))
+            axL.setStyle(tickFont=QtGui.QFont("Segoe UI", 8))
+            axR.setStyle(tickFont=QtGui.QFont("Segoe UI", 8))
+        except Exception:
+            pass
 
         self.vb = self.plot.getViewBox()
-        self.vb.setMouseEnabled(x=True, y=False)     # solo X
-        self.vb.enableAutoRange(x=False, y=False)
+        self.vb.setLimits(minXRange=0.00005)
 
-        # Curva + relleno
-        self.curve = self.plot.plot([], [])
-        self.curve.setPen(pg.mkPen("#e5e7eb", width=1.4))
-        self.curve.setFillLevel(-140)
+        # ======================
+        # Curvas: AVG + PEAK
+        # ======================
+        self.avg_curve = self.plot.plot([], [])
+        self.avg_curve.setPen(pg.mkPen("#e5e7eb", width=1.2))
 
-        grad = QLinearGradient(0, -140, 0, -60)
-        grad.setColorAt(0.0, QColor(30, 64, 175, 180))
-        grad.setColorAt(1.0, QColor(147, 197, 253, 40))
-        self.curve.setBrush(QBrush(grad))
+        # relleno azul (como SDR Control)
+        self.avg_curve.setFillLevel(self._ymin)
+        grad = QLinearGradient(0, self._ymin, 0, self._ymax)
+        grad.setColorAt(0.0, QColor(12, 25, 60, 210))
+        grad.setColorAt(1.0, QColor(65, 105, 180, 80))
+        self.avg_curve.setBrush(QBrush(grad))
 
-        # Estado
+        self.peak_curve = self.plot.plot([], [])
+        self.peak_curve.setPen(pg.mkPen(QColor(210, 210, 210, 170), width=1.0))
+
+        # ======================
+        # Marcador verde (3 líneas)
+        # ======================
         self._tuned_mhz = None
         self._mode = "NFM"
-        self._fft_smooth = None
-        self._fft_alpha = 0.25
-
-        self._full_xmin = None
-        self._full_xmax = None
-        self._span = None
-        self._view_width = None
-        self._x_inited = False
-
-        self._y_auto_lo = None
-        self._y_auto_hi = None
-
         self._sync_lock = False
-        self._syncing_slider = False
 
-        # Región canal (extremos ajustables)
         self.chan_region = pg.LinearRegionItem(
             values=[0.0, 0.0],
             movable=True,
             swapMode="push",
-            brush=pg.mkBrush(34, 197, 94, 35),
+            brush=pg.mkBrush(34, 197, 94, 30),
             pen=pg.mkPen(34, 197, 94, 120, width=1),
         )
         self.chan_region.setZValue(8)
         self.plot.addItem(self.chan_region)
-        self.chan_region.sigRegionChanged.connect(self._on_region_changed_live)
-        self.chan_region.sigRegionChangeFinished.connect(self._on_region_changed_final)
 
-        # Líneas guía + centro movible
-        self.tune_left = pg.InfiniteLine(angle=90, movable=False, pen=pg.mkPen("#22c55e", width=1.6))
+        self.tune_left = pg.InfiniteLine(angle=90, movable=False, pen=pg.mkPen("#22c55e", width=1.4))
         self.tune_center = pg.InfiniteLine(
             angle=90,
             movable=True,
@@ -138,49 +443,111 @@ class SpectrumWidget(QWidget):
             hoverPen=pg.mkPen("#86efac", width=3.4),
         )
         self.tune_center.setZValue(10)
-        self.tune_right = pg.InfiniteLine(angle=90, movable=False, pen=pg.mkPen("#22c55e", width=1.6))
-
+        self.tune_right = pg.InfiniteLine(angle=90, movable=False, pen=pg.mkPen("#22c55e", width=1.4))
         self.plot.addItem(self.tune_left)
         self.plot.addItem(self.tune_center)
         self.plot.addItem(self.tune_right)
 
+        self.chan_region.sigRegionChanged.connect(self._on_region_changed_live)
+        self.chan_region.sigRegionChangeFinished.connect(self._on_region_changed_final)
         self.tune_center.sigPositionChanged.connect(self._on_center_changed_live)
         self.tune_center.sigPositionChangeFinished.connect(self._on_center_changed_final)
 
-        # Overlay
-        self._info = pg.TextItem(color="#e5e7eb", anchor=(0, 0))
+        # ======================
+        # Texto info discreto (opcional)
+        # ======================
+        self._info = pg.TextItem(color="#cbd5e1", anchor=(0, 0))
+        self._info.setZValue(20)
         self.plot.addItem(self._info)
 
-        v.addWidget(self.plot)
+        # ======================
+        # Suavizado + Peak Hold
+        # ======================
+        self._avg = None
+        self._peak = None
+        self._avg_alpha = 0.22          # “natural”
+        self._peak_decay_db = 0.35      # decaimiento por frame (dB)
 
-        # Barra inferior PAN (siempre visible)
-        self.pan_slider = QSlider(Qt.Horizontal)
-        self.pan_slider.setRange(0, 1000)
-        self.pan_slider.setSingleStep(1)
-        self.pan_slider.setPageStep(25)
-        self.pan_slider.setValue(500)
-        self.pan_slider.setMinimumHeight(18)
-        self.pan_slider.valueChanged.connect(self._on_pan_slider)
-        v.addWidget(self.pan_slider)
+        # X range tracking
+        self._full_xmin = None
+        self._full_xmax = None
+        self._span = None
+        self._x_inited = False
 
-        # Sync slider cuando el usuario pan/zoom con mouse
-        try:
-            self.vb.sigRangeChanged.connect(self._on_view_range_changed)
-        except Exception:
-            pass
-
-        # Mouse tune (click/drag)
+        # Mouse tune
         self._drag_tuning = False
-        try:
-            sc = self.plot.scene()
-            sc.sigMouseMoved.connect(self._on_scene_mouse_moved)
-            sc.sigMouseClicked.connect(self._on_scene_mouse_clicked)
-        except Exception:
-            pass
+        sc = self.plot.scene()
+        sc.sigMouseMoved.connect(self._on_scene_mouse_moved)
+        sc.sigMouseClicked.connect(self._on_scene_mouse_clicked)
+
+
+        v.addWidget(self.plot, 1)
+
+        # ======================
+        # Navbar (tu mini-map)
+        # ======================
+        self.navbar = SpectrumNavBar()
+        self.navbar.sig_center_changed.connect(self._on_nav_center)
+        v.addWidget(self.navbar, 0)
+
+        self._syncing_navbar = False
+        self.vb.sigRangeChanged.connect(self._on_view_range_changed)
+
+        self.plot.setMinimumHeight(180)
 
     # ----------------------------
-    # Mouse tune
-    # ----------------------------
+    # Helpers / Layout overlay
+        # ----------------------------
+
+
+    # navbar -> centra la vista
+    def _on_nav_center(self, center_mhz: float):
+        if self._full_xmin is None or self._full_xmax is None:
+            return
+        try:
+            (xr, _yr) = self.plot.viewRange()
+            w = max(0.000001, float(xr[1]) - float(xr[0]))
+        except Exception:
+            w = max(0.000001, float(self._full_xmax) - float(self._full_xmin))
+
+        c = float(center_mhz)
+        x0 = c - w / 2.0
+        x1 = c + w / 2.0
+
+        if x0 < self._full_xmin:
+            x0 = self._full_xmin
+            x1 = x0 + w
+        if x1 > self._full_xmax:
+            x1 = self._full_xmax
+            x0 = x1 - w
+
+        self._syncing_navbar = True
+        try:
+            self.plot.setXRange(x0, x1, padding=0.0)
+        finally:
+            self._syncing_navbar = False
+
+    def _on_view_range_changed(self, *_):
+        
+        if getattr(self, "_syncing_navbar", False):
+            return
+        if self._full_xmin is None or self._full_xmax is None:
+            return
+        try:
+            (xr, _yr) = self.plot.viewRange()
+            x0 = float(xr[0])
+            x1 = float(xr[1])
+        except Exception:
+            return
+
+        c = (x0 + x1) / 2.0
+        w = max(0.000001, x1 - x0)
+
+        self.navbar.set_limits(self._full_xmin, self._full_xmax)
+        self.navbar.set_view_width(w)
+        self.navbar.set_view_center(c)
+
+    # mouse tune
     def _mhz_from_scene_pos(self, scene_pos) -> float | None:
         try:
             p = self.vb.mapSceneToView(scene_pos)
@@ -189,8 +556,7 @@ class SpectrumWidget(QWidget):
             return None
         try:
             xr = self.plot.viewRange()[0]
-            xmin = float(xr[0])
-            xmax = float(xr[1])
+            xmin = float(xr[0]); xmax = float(xr[1])
             if xmax < xmin:
                 xmin, xmax = xmax, xmin
             x_mhz = max(xmin, min(xmax, x_mhz))
@@ -217,17 +583,13 @@ class SpectrumWidget(QWidget):
                 return
         except Exception:
             return
-
         mhz = self._mhz_from_scene_pos(scene_pos)
         if mhz is None:
             return
-
         self._drag_tuning = True
         self.sig_tune.emit(float(mhz), False)
 
-    # ----------------------------
-    # Mode / marker
-    # ----------------------------
+    # mode / marker
     def set_mode(self, mode: str):
         self._mode = (mode or "").upper().strip() or "NFM"
         self._refresh_channel_marker()
@@ -248,89 +610,8 @@ class SpectrumWidget(QWidget):
             self.tune_left.setPos(left)
             self.tune_center.setPos(c)
             self.tune_right.setPos(right)
-            self.chan_region.show()
-            self.tune_left.show()
-            self.tune_center.show()
-            self.tune_right.show()
         except Exception:
             pass
-
-    # ----------------------------
-    # Spectrum update
-    # ----------------------------
-    def update_spectrum(self, freqs_hz, levels_db, tuned_mhz: float | None = None):
-        if freqs_hz is None or len(freqs_hz) == 0:
-            return
-
-        freqs_mhz = (freqs_hz / 1e6) if hasattr(freqs_hz, "__array__") else [f / 1e6 for f in freqs_hz]
-        levels = np.asarray(levels_db, dtype=np.float32)
-
-        if self._fft_smooth is None or len(self._fft_smooth) != len(levels):
-            self._fft_smooth = levels.copy()
-        else:
-            a = float(getattr(self, "_fft_alpha", 0.25))
-            self._fft_smooth = a * levels + (1.0 - a) * self._fft_smooth
-
-        self.curve.setData(freqs_mhz, self._fft_smooth)
-
-        try:
-            xmin = float(freqs_mhz[0])
-            xmax = float(freqs_mhz[-1])
-            if xmax < xmin:
-                xmin, xmax = xmax, xmin
-        except Exception:
-            return
-
-        self._update_limits_and_constraints(xmin, xmax)
-
-        if not self._x_inited:
-            self.plot.setXRange(self._full_xmin, self._full_xmax, padding=0.0)
-            self._x_inited = True
-
-        # Auto-Y suave
-        try:
-            y = self._fft_smooth
-            y = y[np.isfinite(y)]
-            if y.size > 10:
-                lo = float(np.percentile(y, 5))
-                hi = float(np.percentile(y, 99))
-                if hi - lo > 5:
-                    lo -= 10
-                    hi += 5
-                    if self._y_auto_lo is None:
-                        self._y_auto_lo = lo
-                        self._y_auto_hi = hi
-                    else:
-                        k = 0.20
-                        self._y_auto_lo = (1 - k) * self._y_auto_lo + k * lo
-                        self._y_auto_hi = (1 - k) * self._y_auto_hi + k * hi
-                    self.plot.setYRange(self._y_auto_lo, self._y_auto_hi, padding=0.0)
-        except Exception:
-            pass
-
-        # Overlay pos + texto
-        try:
-            (xr, yr) = self.plot.viewRange()
-            self._info.setPos(xr[0], yr[1])
-        except Exception:
-            pass
-
-        try:
-            start = float(freqs_mhz[0])
-            end = float(freqs_mhz[-1])
-            center = (start + end) / 2.0
-            span = end - start
-            tuned_txt = f" | Tuned: {tuned_mhz:.6f} MHz" if tuned_mhz is not None else ""
-            self._info.setText(
-                f"Rango: {start:.6f} – {end:.6f} MHz | Centro: {center:.6f} MHz | Span: {span:.3f} MHz{tuned_txt}"
-            )
-        except Exception:
-            pass
-
-        if tuned_mhz is not None:
-            self.set_tuned_freq_mhz(tuned_mhz)
-
-        self._sync_pan_slider_from_view()
 
     def set_tuned_freq_mhz(self, mhz: float):
         try:
@@ -339,103 +620,95 @@ class SpectrumWidget(QWidget):
         except Exception:
             pass
 
-    # ----------------------------
-    # Constraints + slider sync
-    # ----------------------------
-    def _update_limits_and_constraints(self, xmin: float, xmax: float):
-        self._full_xmin = float(xmin)
-        self._full_xmax = float(xmax)
-        self._span = max(0.000001, self._full_xmax - self._full_xmin)
-
-        # ✅ Permite zoom-out SOLO hasta el span real (evita que "se vea una parte")
+    # API: si tu scanner lo llama
+    def center_on_mhz(self, mhz: float):
         try:
-            self.vb.setLimits(
-                xMin=self._full_xmin,
-                xMax=self._full_xmax,
-                minXRange=0.00005,         # zoom-in permitido
-                maxXRange=self._span       # zoom-out máximo = span
-            )
+            (xr, _yr) = self.plot.viewRange()
+            w = float(xr[1]) - float(xr[0])
+            c = float(mhz)
+            self.plot.setXRange(c - w / 2.0, c + w / 2.0, padding=0.0)
         except Exception:
             pass
 
+    # ----------------------------
+    # Update spectrum (AVG + PEAK)
+    # ----------------------------
+    def update_spectrum(self, freqs_hz, levels_db, tuned_mhz: float | None = None):
+        if freqs_hz is None or len(freqs_hz) == 0:
+            return
+
+        freqs_mhz = (freqs_hz / 1e6) if hasattr(freqs_hz, "__array__") else [f / 1e6 for f in freqs_hz]
+        y = np.asarray(levels_db, dtype=np.float32)
+
+        # init
+        if self._avg is None or self._avg.shape != y.shape:
+            self._avg = y.copy()
+            self._peak = y.copy()
+        else:
+            a = float(self._avg_alpha)
+            self._avg = a * y + (1.0 - a) * self._avg
+
+            # peak-hold con decaimiento (dB)
+            decay = float(self._peak_decay_db)
+            self._peak = np.maximum(self._peak - decay, y)
+
+            x = np.asarray(freqs_mhz, dtype=np.float32)
+            y_avg = np.asarray(self._avg, dtype=np.float32)
+            y_pk  = np.asarray(self._peak, dtype=np.float32)
+
+            m = np.isfinite(x) & np.isfinite(y_avg) & np.isfinite(y_pk)
+            x = x[m]; y_avg = y_avg[m]; y_pk = y_pk[m]
+
+            self.avg_curve.setData(x, y_avg)
+            self.peak_curve.setData(x, y_pk)
+
+        # rango X completo
         try:
-            (xr, _yr) = self.plot.viewRange()
-            self._view_width = max(0.000001, float(xr[1]) - float(xr[0]))
-        except Exception:
-            self._view_width = self._span
-
-    def _on_view_range_changed(self, *_args):
-        if self._full_xmin is None or self._full_xmax is None:
-            return
-        try:
-            (xr, _yr) = self.plot.viewRange()
-            self._view_width = max(0.000001, float(xr[1]) - float(xr[0]))
-        except Exception:
-            return
-        self._sync_pan_slider_from_view()
-
-    def _sync_pan_slider_from_view(self):
-        if self._full_xmin is None or self._full_xmax is None or not self._view_width:
-            return
-
-        span = max(0.000001, self._full_xmax - self._full_xmin)
-        w = float(self._view_width)
-
-        # si w >= span, slider centrado
-        if w >= span:
-            self._syncing_slider = True
-            self.pan_slider.blockSignals(True)
-            self.pan_slider.setValue(500)
-            self.pan_slider.blockSignals(False)
-            self._syncing_slider = False
-            return
-
-        try:
-            (xr, _yr) = self.plot.viewRange()
-            x0 = float(xr[0])
+            xmin = float(freqs_mhz[0])
+            xmax = float(freqs_mhz[-1])
+            if xmax < xmin:
+                xmin, xmax = xmax, xmin
         except Exception:
             return
 
-        travel = max(0.000001, span - w)
-        t = (x0 - self._full_xmin) / travel
-        t = max(0.0, min(1.0, t))
+        self._full_xmin = xmin
+        self._full_xmax = xmax
+        self._span = max(0.000001, self._full_xmax - self._full_xmin)
 
-        self._syncing_slider = True
-        self.pan_slider.blockSignals(True)
-        self.pan_slider.setValue(int(t * 1000))
-        self.pan_slider.blockSignals(False)
-        self._syncing_slider = False
+        self.vb.setLimits(
+            xMin=self._full_xmin,
+            xMax=self._full_xmax,
+            minXRange=0.00005,
+            maxXRange=self._span
+        )
 
-    def _on_pan_slider(self, val: int):
-        if self._syncing_slider:
-            return
-        if self._full_xmin is None or self._full_xmax is None or not self._view_width:
-            return
-
-        span = max(0.000001, self._full_xmax - self._full_xmin)
-        w = float(self._view_width)
-
-        if w >= span:
+        if not self._x_inited:
             self.plot.setXRange(self._full_xmin, self._full_xmax, padding=0.0)
-            return
+            self._x_inited = True
 
-        travel = max(0.0, span - w)
-        t = float(val) / 1000.0
+        # info discreto (como el badge “Freq/Span” del screenshot)
+        try:
+            start = float(freqs_mhz[0])
+            end = float(freqs_mhz[-1])
+            center = (start + end) / 2.0
+            span = end - start
+            tuned_txt = f" | Tuned: {tuned_mhz:.6f} MHz" if tuned_mhz is not None else ""
+            self._info.setText(f"Freq: {center:.6f} MHz | Span: ±{(span/2.0)*1000.0:.0f} kHz{tuned_txt}")
+            (xr, yr) = self.plot.viewRange()
+            self._info.setPos(xr[0] + 0.01 * (xr[1] - xr[0]), yr[1] - 2)
+        except Exception:
+            pass
 
-        x0 = self._full_xmin + t * travel
-        x1 = x0 + w
+       
 
-        if x0 < self._full_xmin:
-            x0 = self._full_xmin
-            x1 = x0 + w
-        if x1 > self._full_xmax:
-            x1 = self._full_xmax
-            x0 = x1 - w
+        if tuned_mhz is not None:
+            self.set_tuned_freq_mhz(tuned_mhz)
 
-        self.plot.setXRange(x0, x1, padding=0.0)
+        # sync navbar
+        self._on_view_range_changed()
 
     # ----------------------------
-    # Interacción canal (verde)
+    # verde interactivo
     # ----------------------------
     def _emit_tune(self, mhz: float, final: bool):
         try:
@@ -457,7 +730,7 @@ class SpectrumWidget(QWidget):
             self.tune_left.setPos(left)
             self.tune_right.setPos(right)
             self._tuned_mhz = c
-            self._emit_tune(c, False)   # NO retunar hardware (MainWindow lo hace solo al final)
+            self._emit_tune(c, False)
         except Exception:
             pass
         finally:
@@ -477,8 +750,7 @@ class SpectrumWidget(QWidget):
         self._sync_lock = True
         try:
             left, right = self.chan_region.getRegion()
-            left = float(left)
-            right = float(right)
+            left = float(left); right = float(right)
             c = (left + right) / 2.0
             self.tune_center.setValue(c)
             self.tune_left.setPos(left)
@@ -499,29 +771,27 @@ class SpectrumWidget(QWidget):
         except Exception:
             pass
 
+    def set_fixed_dbm_range(self, ymin: float, ymax: float):
+        self._ymin = float(ymin)
+        self._ymax = float(ymax)
+        try:
+            self.plot.setYRange(self._ymin, self._ymax, padding=0.0)
+        except Exception:
+            pass
+        try:
+            axL = self.plot.getAxis("left")
+            axR = self.plot.getAxis("right")
+
+            def _db_ticks():
+                vals = list(range(int(self._ymin), int(self._ymax) + 1, 5))
+                return [(v, f"{v} dBm") for v in vals]
+
+            axL.setTicks([_db_ticks()])
+            axR.setTicks([_db_ticks()])
+        except Exception:
+            pass        
 
 
-
-class WaveformWidget(QWidget):
-    """Waveform (arriba), tipo SDR Console."""
-    def __init__(self, parent=None):
-        super().__init__(parent)
-        v = QVBoxLayout(self)
-        v.setContentsMargins(8, 8, 8, 8)
-
-        self.plot = pg.PlotWidget()
-        self.plot.setBackground("#020617")
-        self.plot.showGrid(x=True, y=True, alpha=0.2)
-        self.plot.setLabel("bottom", "Tiempo")
-        self.plot.setLabel("left", "Amplitud")
-
-        self.curve = self.plot.plot([], [], pen=pg.mkPen("#f9fafb", width=1.0))
-        v.addWidget(self.plot)
-
-    def update_waveform(self, x, y):
-        if y is None:
-            return
-        self.curve.setData(x, y)
 
 
 class LeftPanel(QWidget):
@@ -713,7 +983,7 @@ class MainWindow(QMainWindow):
         self.ribbon = RibbonBar()
         central_layout.addWidget(self.ribbon)
 
-        self.waveform = WaveformWidget()
+       
 
         self.spectrum = SpectrumWidget()
 
@@ -732,7 +1002,7 @@ class MainWindow(QMainWindow):
 
         self.spectrum.set_mode(self.current_mode)  # ✅ marcador 3 líneas inicial
 
-        self.waterfall = WaterfallWidget()
+
 
                 # =========================
         # Dial manual en waterfall (mouse -> tune)
@@ -748,18 +1018,31 @@ class MainWindow(QMainWindow):
             pass
 
 
+        # =========================
+        # Spectrum + BandBar + Waterfall (tipo SDR Control)
+        # =========================
+        self.bandbar = BandBar("MARINE VHF")  # puedes cambiar dinámicamente luego
+        
+        self.waterfall = WaterfallWidget()
+        self.bandbar = BandBar("—")
+
         bottom_split = QSplitter(Qt.Vertical)
         bottom_split.addWidget(self.spectrum)
+        bottom_split.addWidget(self.bandbar)
         bottom_split.addWidget(self.waterfall)
+
         bottom_split.setStretchFactor(0, 2)
-        bottom_split.setStretchFactor(1, 3)
+        bottom_split.setStretchFactor(1, 0)
+        bottom_split.setStretchFactor(2, 3)
+
+        # fija la barra verde para que no se “estire”
+        self.bandbar.setMinimumHeight(22)
+        self.bandbar.setMaximumHeight(22)
+
 
         main_split = QSplitter(Qt.Vertical)
-        main_split.addWidget(self.waveform)
         main_split.addWidget(bottom_split)
-        main_split.setStretchFactor(0, 2)
-        main_split.setStretchFactor(1, 5)
-
+        main_split.setStretchFactor(0, 1)
         central_layout.addWidget(main_split)
         self.setCentralWidget(central)
 
@@ -1508,6 +1791,8 @@ class MainWindow(QMainWindow):
 
 
     # ---------- Update FFT + Waterfall ----------
+
+
     def _update_from_active_device(self):
 
         if self.active_driver is None:
@@ -1544,7 +1829,6 @@ class MainWindow(QMainWindow):
             return
 
         if freqs.shape[0] != levels_raw.shape[0]:
-            # Si no coincide, aborta para evitar crashes raros
             return
 
         # Si freqs viene invertido, ordena ambos
@@ -1558,22 +1842,26 @@ class MainWindow(QMainWindow):
         # -------------------------------------------------
         levels_for_spec = levels_raw
 
-        # Heurística:
-        # - Si la mayoría de valores son >= 0, probablemente es potencia/magnitud (lineal)
-        # - Si hay negativos, probablemente ya está en dB
         try:
             finite = np.isfinite(levels_raw)
             if finite.any():
                 lv = levels_raw[finite]
-                # Si casi todo es >= 0 -> convertir a dB
+
+                # 1) si viene en lineal (>=0) -> a dBFS
                 frac_nonneg = float(np.mean(lv >= 0))
                 if frac_nonneg > 0.90:
                     eps = 1e-12
-                    levels_for_spec = 20.0 * np.log10(np.maximum(lv, eps))
-                    # re-inyecta en el mismo shape
-                    tmp = levels_raw.copy()
-                    tmp[finite] = levels_for_spec
-                    levels_for_spec = tmp
+                    lv = 20.0 * np.log10(np.maximum(lv, eps))
+
+                # 2) si NO parece dBm real (picos > -20 dB), aplica offset automático para caer en -130..-40
+                p = float(np.percentile(lv, 99.5))
+                if p > -20.0:
+                    # mapea el pico alto a ~ -45 dBm (look SDR Control)
+                    lv = lv + (-45.0 - p)
+
+                tmp = levels_raw.copy()
+                tmp[finite] = lv
+                levels_for_spec = tmp
         except Exception:
             levels_for_spec = levels_raw
 
@@ -1599,11 +1887,33 @@ class MainWindow(QMainWindow):
             tuned_mhz = float(self.freq_spin.value())
 
         # -------------------------------------------------
+        # 2.5) BandBar por rango (MARINE/AIR/FM)
+        # -------------------------------------------------
+        try:
+            f = float(tuned_mhz)
+            if 156.0 <= f <= 174.0:
+                self.bandbar.set_text("MARINE VHF")
+            elif 118.0 <= f <= 137.0:
+                self.bandbar.set_text("AIR BAND")
+            elif 88.0 <= f <= 108.0:
+                self.bandbar.set_text("FM BROADCAST")
+            else:
+                self.bandbar.set_text("—")
+        except Exception:
+            pass
+
+        # -------------------------------------------------
         # 3) Spectrum: usa levels_for_spec (ya en dB si aplica)
         # -------------------------------------------------
         try:
             self.spectrum.update_spectrum(freqs, levels_for_spec, tuned_mhz=tuned_mhz)
             self.spectrum.set_tuned_freq_mhz(tuned_mhz)
+        except Exception:
+            pass
+
+        
+        try:
+            self.spectrum.set_fixed_dbm_range(-130.0, -40.0)
         except Exception:
             pass
 
@@ -1615,9 +1925,6 @@ class MainWindow(QMainWindow):
                 self.waterfall.append_line(levels_raw)
         except Exception:
             pass
-
-        # ❌ Waveform: NO usar FFT como waveform (quítalo)
-        # (Cuando tengamos IQ/audio real, ahí sí lo pintamos)
 
         # -------------------------------------------------
         # 5) Status + axis waterfall
@@ -1645,6 +1952,7 @@ class MainWindow(QMainWindow):
             self.waterfall.set_tuned_freq(float(tuned_mhz) * 1e6)
         except Exception:
             pass
+
 
 
 
