@@ -394,22 +394,17 @@ class SpectrumWidget(QWidget):
         self.vb.setLimits(minXRange=0.00005)
 
         # ======================
-        # Curvas: AVG + PEAK
+        # Curva: AVG (suave)
         # ======================
         self.avg_curve = self.plot.plot([], [])
         self.avg_curve.setPen(pg.mkPen("#e5e7eb", width=1.2))
 
-        # relleno azul (como SDR Control)
-        self.avg_curve.setFillLevel(-140.0)
+        # relleno azul (piso real = self._ymin)
+        self.avg_curve.setFillLevel(self._ymin)
         grad = QLinearGradient(0, self._ymin, 0, self._ymax)
         grad.setColorAt(0.0, QColor(12, 25, 60, 210))
         grad.setColorAt(1.0, QColor(65, 105, 180, 80))
         self.avg_curve.setBrush(QBrush(grad))
-
-        # POR ESTE (piso real = self._ymin):
-
-        self.avg_curve = self.plot.plot([], [])
-        self.avg_curve.setPen(pg.mkPen("#e5e7eb", width=1.2))
 
         self.avg_curve.setFillLevel(self._ymin)
         grad = QLinearGradient(0, self._ymin, 0, self._ymax)
@@ -532,9 +527,6 @@ class SpectrumWidget(QWidget):
         finally:
             self._syncing_navbar = False
 
-        self._freeze_spectrum_live = True
-        self._last_draw_x = None
-        self._last_draw_y = None
 
     def _on_view_range_changed(self, *_):
         
@@ -657,21 +649,42 @@ class SpectrumWidget(QWidget):
         if x.size == 0:
             return
 
-        # init / EMA (SIEMPRE)
-        if self._avg is None or self._avg.shape != y.shape:
-            self._avg = y.copy()
-        else:
-            a = float(self._avg_alpha)
-            self._avg = a * y + (1.0 - a) * self._avg
-            self._avg = a * self._avg + (1.0 - a) * np.roll(self._avg, 1)
+        # --- Suavizado NATURAL (tipo SDR Console) ---
+        # Guardamos la grilla anterior para interpolar cuando cambie el span/FFT bins
+        prev_x = getattr(self, "_last_x", None)
 
-        if getattr(self, "_freeze_spectrum_live", False) and getattr(self, "_drag_tuning", False):
-            if self._last_draw_x is not None and self._last_draw_y is not None:
-                self.avg_curve.setData(self._last_draw_x, self._last_draw_y)
+        # micro-suavizado espacial (3 taps) para bajar "dientes" sin borrar señales
+        y_s = y.copy()
+        if y_s.size >= 3:
+            y_s[1:-1] = (y[:-2] + y[1:-1] + y[2:]) / 3.0
+
+        if self._avg is None:
+            self._avg = y_s.copy()
         else:
-            self.avg_curve.setData(x, self._avg)
-            self._last_draw_x = x.copy()
-            self._last_draw_y = self._avg.copy()
+            # Si cambió el eje X (retune / FFT size), interpolamos el promedio anterior a la nueva grilla
+            if prev_x is not None and prev_x.size >= 2 and x.size >= 2:
+                if prev_x.shape != x.shape or (float(prev_x[0]) != float(x[0])) or (float(prev_x[-1]) != float(x[-1])):
+                    try:
+                        self._avg = np.interp(
+                            x.astype(np.float64),
+                            prev_x.astype(np.float64),
+                            self._avg.astype(np.float64),
+                            left=float(self._avg[0]),
+                            right=float(self._avg[-1]),
+                        ).astype(np.float32)
+                    except Exception:
+                        pass
+
+            a = float(self._avg_alpha)  # 0.06..0.18 recomendado
+            self._avg = (1.0 - a) * self._avg + a * y_s
+
+        # guarda grilla actual
+        self._last_x = x.copy()
+
+        self.avg_curve.setData(x, self._avg)
+        self._last_draw_x = x.copy()
+        self._last_draw_y = self._avg.copy()
+
 
         try:
             vv = self._avg[np.isfinite(self._avg)]
@@ -1052,7 +1065,18 @@ class MainWindow(QMainWindow):
 
 
 
-                # =========================
+
+
+
+        # =========================
+        # Spectrum + BandBar + Waterfall (tipo SDR Control)
+        # =========================
+        self.bandbar = BandBar("MARINE VHF")  # puedes cambiar dinámicamente luego
+        
+        self.waterfall = WaterfallWidget()
+        self.bandbar = BandBar("—")
+
+                        # =========================
         # Dial manual en waterfall (mouse -> tune)
         # =========================
         self._wf_tune_timer = QTimer(self)
@@ -1064,15 +1088,6 @@ class MainWindow(QMainWindow):
             self.waterfall.sig_tune.connect(self._on_waterfall_tune)
         except Exception:
             pass
-
-
-        # =========================
-        # Spectrum + BandBar + Waterfall (tipo SDR Control)
-        # =========================
-        self.bandbar = BandBar("MARINE VHF")  # puedes cambiar dinámicamente luego
-        
-        self.waterfall = WaterfallWidget()
-        self.bandbar = BandBar("—")
 
         bottom_split = QSplitter(Qt.Vertical)
         bottom_split.addWidget(self.spectrum)
@@ -1490,6 +1505,48 @@ class MainWindow(QMainWindow):
                 self.active_driver.set_center_freq(float(mhz) * 1e6)
         except Exception:
             pass
+
+    def _on_navbar_tune(self, mhz: float, final: bool):
+        # Si el escáner está corriendo, no peleamos
+        try:
+            if getattr(self, "scanner", None) is not None and getattr(self.scanner, "is_running", False):
+                return
+        except Exception:
+            pass
+
+        mhz = float(mhz)
+
+        # Actualiza el dial sin disparar valueChanged
+        try:
+            if hasattr(self, "freq_spin") and self.freq_spin is not None:
+                if not self.freq_spin.hasFocus() and not self.freq_spin.lineEdit().hasFocus():
+                    self.freq_spin.blockSignals(True)
+                    self.freq_spin.setValue(mhz)
+                    self.freq_spin.blockSignals(False)
+        except Exception:
+            pass
+
+        # Mueve el marcador verde del espectro
+        try:
+            self.spectrum.set_tuned_freq_mhz(mhz)
+        except Exception:
+            pass
+
+        # Mientras arrastras: retune suave (throttle)
+        if not final:
+            try:
+                self._spec_tune_timer.start()
+            except Exception:
+                pass
+            return
+
+        # Al soltar: aplica inmediato
+        try:
+            self._spec_tune_timer.stop()
+        except Exception:
+            pass
+        self._apply_tune()
+
 
         
     def _on_nav_edge_recenter(self, new_center_mhz: float):
