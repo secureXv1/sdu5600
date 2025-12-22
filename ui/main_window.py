@@ -367,8 +367,8 @@ class SpectrumWidget(QWidget):
         axL.setLabel("dBm")
         axR.setLabel("dBm")
 
-        # Ticks dB (cada 5 dB, -40 arriba a -130 abajo)
-        self._ymin = -160.0
+        # CAMBIO DEL PISO EN EL ESPECTRO
+        self._ymin = -80.0
         self._ymax = -45.0
         
         self.plot.setYRange(self._ymin, self._ymax, padding=0.0)
@@ -399,18 +399,13 @@ class SpectrumWidget(QWidget):
         self.avg_curve = self.plot.plot([], [])
         self.avg_curve.setPen(pg.mkPen("#e5e7eb", width=1.2))
 
-        # relleno azul (piso real = self._ymin)
+        # relleno azul (piso fijo)
         self.avg_curve.setFillLevel(self._ymin)
         grad = QLinearGradient(0, self._ymin, 0, self._ymax)
         grad.setColorAt(0.0, QColor(12, 25, 60, 210))
         grad.setColorAt(1.0, QColor(65, 105, 180, 80))
         self.avg_curve.setBrush(QBrush(grad))
 
-        self.avg_curve.setFillLevel(self._ymin)
-        grad = QLinearGradient(0, self._ymin, 0, self._ymax)
-        grad.setColorAt(0.0, QColor(12, 25, 60, 210))
-        grad.setColorAt(1.0, QColor(65, 105, 180, 80))
-        self.avg_curve.setBrush(QBrush(grad))
 
         # ======================
         # Marcador verde (3 líneas)
@@ -685,37 +680,13 @@ class SpectrumWidget(QWidget):
         self._last_draw_x = x.copy()
         self._last_draw_y = self._avg.copy()
 
-
+        # Y fijo: piso constante (sin “respirar” al cambiar de rango)
         try:
-            vv = self._avg[np.isfinite(self._avg)]
-            if vv.size > 16:
-                p10 = float(np.percentile(vv, 10.0))
-                p995 = float(np.percentile(vv, 99.5))
-
-                target_low = p10 - 5.0   # piso más abajo
-                target_high = p995 + 10.0  # aire arriba
-
-                # límites razonables
-                target_low = max(-190.0, min(-80.0, target_low))
-                target_high = max(-120.0, min(-20.0, target_high))
-
-                # evita invertir
-                if target_high - target_low < 40.0:
-                    target_low = target_high - 40.0
-
-                a = float(self._yr_alpha)
-                self._ylow = (1.0 - a) * self._ylow + a * target_low
-                self._yhigh = (1.0 - a) * self._yhigh + a * target_high
-
-                self.plot.setYRange(self._ylow, self._yhigh, padding=0.0)
-
-                # relleno siempre desde el piso actual
-                try:
-                    self.avg_curve.setFillLevel(self._ylow)
-                except Exception:
-                    pass
+            self.plot.setYRange(self._ymin, self._ymax, padding=0.0)
+            self.avg_curve.setFillLevel(self._ymin)
         except Exception:
             pass
+                
 
         # rango X completo
         try:
@@ -1045,8 +1016,9 @@ class MainWindow(QMainWindow):
 
         self.spectrum = SpectrumWidget()
 
+        
         self.spectrum.navbar.sig_center_changed.connect(self.spectrum._on_nav_center)
-        self.spectrum.navbar.sig_edge_recenter.connect(self._on_nav_edge_recenter)
+
 
                 # =========================
         # Dial manual desde espectro
@@ -1130,6 +1102,15 @@ class MainWindow(QMainWindow):
         self.setStatusBar(status)
         self.lbl_status = QLabel("Listo · SDR Style")
         status.addPermanentWidget(self.lbl_status)
+
+        # =========================
+        #  Calibración visual del nivel (piso estable)
+        #  Evita que el “piso” suba/baje según haya o no señales fuertes.
+        # =========================
+        self._spec_floor_target_dbm = -76.0  # ajusta aquí (p.ej. -100, -110, -120)
+        self._spec_offset_db = None          # offset calculado (suavizado)
+        self._spec_offset_alpha = 0.04       # suavizado (0.01..0.10)
+
 
         # =========================
         #  Estado monitor/audio
@@ -1476,35 +1457,38 @@ class MainWindow(QMainWindow):
 
 
     def _on_spectrum_tune(self, mhz: float, final: bool):
-        # LIVE: solo mueve marcador + actualiza UI (NO retunea driver)
+        mhz = float(mhz)
+
+        # LIVE: mueve marcador + UI
+        try:
+            if hasattr(self, "freq_spin") and self.freq_spin is not None:
+                if not self.freq_spin.hasFocus() and not self.freq_spin.lineEdit().hasFocus():
+                    self.freq_spin.blockSignals(True)
+                    self.freq_spin.setValue(mhz)
+                    self.freq_spin.blockSignals(False)
+        except Exception:
+            pass
+
+        try:
+            self.spectrum.set_tuned_freq_mhz(mhz)
+        except Exception:
+            pass
+
+        # Mientras arrastras: retune suave (throttle)
         if not final:
             try:
-                if hasattr(self, "freq_spin") and self.freq_spin is not None:
-                    if not self.freq_spin.hasFocus() and not self.freq_spin.lineEdit().hasFocus():
-                        self.freq_spin.blockSignals(True)
-                        self.freq_spin.setValue(float(mhz))
-                        self.freq_spin.blockSignals(False)
-            except Exception:
-                pass
-            try:
-                self.spectrum.set_tuned_freq_mhz(float(mhz))
+                self._spec_tune_timer.start()  # llama a _apply_tune cada ~60ms
             except Exception:
                 pass
             return
 
-        # FINAL: aquí sí retune real
+        # Al soltar: aplica inmediato
         try:
-            self.freq_spin.blockSignals(True)
-            self.freq_spin.setValue(float(mhz))
-            self.freq_spin.blockSignals(False)
+            self._spec_tune_timer.stop()
         except Exception:
             pass
+        self._apply_tune()
 
-        try:
-            if self.active_driver is not None and hasattr(self.active_driver, "set_center_freq"):
-                self.active_driver.set_center_freq(float(mhz) * 1e6)
-        except Exception:
-            pass
 
     def _on_navbar_tune(self, mhz: float, final: bool):
         # Si el escáner está corriendo, no peleamos
@@ -1988,11 +1972,44 @@ class MainWindow(QMainWindow):
                     eps = 1e-12
                     lv = 20.0 * np.log10(np.maximum(lv, eps))
 
-                # 2) si NO parece dBm real (picos > -20 dB), aplica offset automático para caer en -130..-40
-                p = float(np.percentile(lv, 99.5))
-                if p > -20.0:
-                    # mapea el pico alto a ~ -45 dBm (look SDR Control)
-                    lv = lv + (-45.0 - p)
+            # -------------------------------------------------
+            # 1) PARA EL ESPECTRO: normaliza a dB con piso ESTABLE
+            #    (sin tocar el waterfall)
+            # -------------------------------------------------
+            levels_for_spec = levels_raw
+
+            try:
+                finite = np.isfinite(levels_raw)
+                if finite.any():
+                    lv = levels_raw[finite].astype(np.float64)
+
+                    # 1) Si viene lineal (magnitud/power >= 0) -> dB
+                    if float(np.mean(lv >= 0)) > 0.90:
+                        eps = 1e-12
+                        lv = 20.0 * np.log10(np.maximum(lv, eps))
+
+                    # 2) Piso estable (NO por pico):
+                    #    ajustamos el offset usando un percentil bajo (ruido), y lo suavizamos.
+                    floor = float(np.percentile(lv, 30.0))  # 20..40 suele ir bien
+                    target = float(getattr(self, "_spec_floor_target_dbm", -115.0))
+                    off_needed = target - floor
+
+                    if getattr(self, "_spec_offset_db", None) is None:
+                        self._spec_offset_db = off_needed
+                    else:
+                        a = float(getattr(self, "_spec_offset_alpha", 0.04))
+                        self._spec_offset_db = (1.0 - a) * float(self._spec_offset_db) + a * off_needed
+
+                    # clamp defensivo (evita locuras si el driver entrega basura)
+                    self._spec_offset_db = max(-200.0, min(200.0, float(self._spec_offset_db)))
+                    lv = lv + float(self._spec_offset_db)
+
+                    tmp = levels_raw.copy()
+                    tmp[finite] = lv
+                    levels_for_spec = tmp
+            except Exception:
+                levels_for_spec = levels_raw
+
 
                 tmp = levels_raw.copy()
                 tmp[finite] = lv
