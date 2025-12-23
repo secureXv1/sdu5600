@@ -232,21 +232,34 @@ class SpectrumNavBar(QWidget):
         """)
 
     def set_limits(self, xmin_mhz: float, xmax_mhz: float):
+        prev_center = None
+        try:
+            l, r = self.region.getRegion()
+            prev_center = (float(l) + float(r)) / 2.0
+        except Exception:
+            prev_center = None
+
         self._xmin = float(xmin_mhz)
         self._xmax = float(xmax_mhz)
-        self.plot.setXRange(self._xmin, self._xmax, padding=0.0)
-        self.vb.setLimits(xMin=self._xmin, xMax=self._xmax, minXRange=0.00005, maxXRange=max(0.00005, self._xmax - self._xmin))
 
-        # región por defecto si falta
+        self.plot.setXRange(self._xmin, self._xmax, padding=0.0)
+        self.vb.setLimits(
+            xMin=self._xmin,
+            xMax=self._xmax,
+            minXRange=0.00005,
+            maxXRange=max(0.00005, self._xmax - self._xmin),
+        )
+
+        # view width por defecto si falta
         if self._view_w is None:
             self._view_w = max(0.0002, (self._xmax - self._xmin) * 0.20)
 
-        # asegura región válida
-        try:
-            c = (self._xmin + self._xmax) / 2.0
-            self.set_view_center(c)
-        except Exception:
-            pass
+        # ✅ CLAVE: si ya estabas posicionado en algún lugar, conservar ese centro
+        if prev_center is None:
+            prev_center = (self._xmin + self._xmax) / 2.0
+
+        self.set_view_center(prev_center)
+
 
     def set_view_width(self, w_mhz: float):
         self._view_w = max(0.00005, float(w_mhz))
@@ -300,27 +313,34 @@ class SpectrumNavBar(QWidget):
         if self._sync:
             return
 
-        # si llega a un borde, pedimos “re-centrar” retuneando el span
+        # Siempre emite el centro final (paneo normal)
+        self._emit_center(True)
+
+        # Si estamos pegados al borde, pedimos “re-centrar” el SPAN (retune)
         try:
+            if self._xmin is None or self._xmax is None:
+                return
+
             left, right = self.region.getRegion()
-            left = float(left); right = float(right)
+            left = float(left)
+            right = float(right)
             w = max(0.00005, right - left)
-            margin = max(w * 0.10, 0.00010)
+
+            # margen: qué tan cerca del borde cuenta como “tope”
+            margin = max(w * 0.08, 0.00010)
 
             hit_left = (left <= (self._xmin + margin))
             hit_right = (right >= (self._xmax - margin))
 
-            self._emit_center(True)
+            if hit_left or hit_right:
+                new_center = (left + right) / 2.0
+                self.sig_edge_recenter.emit(float(new_center))
 
-            if hit_left:
-                # mueve el “span” hacia abajo para que el rect quede centrado
-                new_center = (left + right) / 2.0 - (w * 0.60)
-                self.sig_edge_recenter.emit(float(new_center))
-            elif hit_right:
-                new_center = (left + right) / 2.0 + (w * 0.60)
-                self.sig_edge_recenter.emit(float(new_center))
         except Exception:
             pass
+
+
+
 
     def set_tuned_freq(self, mhz: float | None):
         """Muestra en la mini-barra la frecuencia escuchada (solo indicador)."""
@@ -538,6 +558,8 @@ class SpectrumWidget(QWidget):
         self._ylow = float(self._ymin)
         self._yhigh = float(self._ymax)
         self._yr_alpha = 0.12   # suavizado del auto-range (0.05..0.20)
+        self._nav_last_limits = None
+
 
     # ----------------------------
     # Helpers / Layout overlay
@@ -575,11 +597,11 @@ class SpectrumWidget(QWidget):
 
 
     def _on_view_range_changed(self, *_):
-        
         if getattr(self, "_syncing_navbar", False):
             return
         if self._full_xmin is None or self._full_xmax is None:
             return
+
         try:
             (xr, _yr) = self.plot.viewRange()
             x0 = float(xr[0])
@@ -590,9 +612,15 @@ class SpectrumWidget(QWidget):
         c = (x0 + x1) / 2.0
         w = max(0.000001, x1 - x0)
 
-        self.navbar.set_limits(self._full_xmin, self._full_xmax)
+        # Solo actualiza límites si cambiaron de verdad (cuando cambia el span completo)
+        if getattr(self, "_nav_last_limits", None) != (self._full_xmin, self._full_xmax):
+            self._nav_last_limits = (self._full_xmin, self._full_xmax)
+            self.navbar.set_limits(self._full_xmin, self._full_xmax)
+
+        # Siempre sincroniza vista actual
         self.navbar.set_view_width(w)
         self.navbar.set_view_center(c)
+
 
     # mouse tune
     def _mhz_from_scene_pos(self, scene_pos) -> float | None:
@@ -757,6 +785,7 @@ class SpectrumWidget(QWidget):
         self._full_xmin = xmin
         self._full_xmax = xmax
         self._span = max(0.000001, self._full_xmax - self._full_xmin)
+        
 
         self.vb.setLimits(
             xMin=self._full_xmin,
@@ -1074,7 +1103,13 @@ class MainWindow(QMainWindow):
 
         self.spectrum = SpectrumWidget()
 
-        
+
+        try:
+            self.spectrum.navbar.sig_edge_recenter.connect(self._on_nav_edge_recenter)
+        except Exception:
+            pass
+
+                
        
                 # =========================
         # Dial manual desde espectro
@@ -1109,6 +1144,14 @@ class MainWindow(QMainWindow):
             self.waterfall.sig_view_window_changed.connect(self._on_waterfall_nav_window)
         except Exception:
             pass
+
+        # edge recenter: si el selector inferior llega a tope, corre el span para seguir navegando
+        try:
+            if hasattr(self.waterfall, 'sig_nav_edge_recenter'):
+                self.waterfall.sig_nav_edge_recenter.connect(self._on_waterfall_nav_edge_recenter)
+        except Exception:
+            pass
+
 
         # sincronizar selector cuando el espectro superior cambia su vista (zoom/pan)
         try:
@@ -1606,19 +1649,36 @@ class MainWindow(QMainWindow):
 
         
     def _on_nav_edge_recenter(self, new_center_mhz: float):
-        # retune para “correr” el span y que el rectángulo quede centrado
+        # Si el escáner está corriendo, no peleamos
         try:
-            if self.active_driver is not None and hasattr(self.active_driver, "set_center_freq"):
-                self.active_driver.set_center_freq(float(new_center_mhz) * 1e6)
+            if getattr(self, "scanner", None) is not None and getattr(self.scanner, "is_running", False):
+                return
         except Exception:
             pass
 
+        new_center_mhz = float(new_center_mhz)
+
+        # throttle: evita retunes repetidos casi iguales
         try:
-            # mantiene el dial coherente
+            cur = float(self.freq_spin.value()) if hasattr(self, "freq_spin") and self.freq_spin is not None else None
+            if cur is not None and abs(new_center_mhz - cur) < 0.00005:  # 50 Hz aprox
+                return
+        except Exception:
+            pass
+
+        # retune para “correr” el span y habilitar seguir navegando
+        try:
+            if self.active_driver is not None and hasattr(self.active_driver, "set_center_freq"):
+                self.active_driver.set_center_freq(new_center_mhz * 1e6)
+        except Exception:
+            pass
+
+        # mantener UI coherente (el dial muestra el nuevo center)
+        try:
             if hasattr(self, "freq_spin") and self.freq_spin is not None:
                 if not self.freq_spin.hasFocus() and not self.freq_spin.lineEdit().hasFocus():
                     self.freq_spin.blockSignals(True)
-                    self.freq_spin.setValue(float(new_center_mhz))
+                    self.freq_spin.setValue(new_center_mhz)
                     self.freq_spin.blockSignals(False)
         except Exception:
             pass
@@ -2184,6 +2244,14 @@ class MainWindow(QMainWindow):
                 f"{self.active_device_name} · Tuned {tuned_mhz:.6f} MHz · "
                 f"Rango {freqs[0]/1e6:.6f}–{freqs[-1]/1e6:.6f} MHz · Span {span_mhz:.3f} MHz{mm}"
             )
+
+            # centro real del span capturado (para edge-recenter del selector)
+            try:
+                self._last_span_center_mhz = (float(freqs[0]) + float(freqs[-1])) / 2.0 / 1e6
+            except Exception:
+                pass
+
+
         except Exception:
             pass
 
@@ -2454,6 +2522,36 @@ class MainWindow(QMainWindow):
             self._refresh_scanner_panel()
         except Exception as e:
             QMessageBox.warning(self, "Eliminar", str(e))
+
+
+    def _on_waterfall_nav_edge_recenter(self, new_center_mhz: float):
+        """Si el selector inferior del waterfall llega al tope y sueltas, corre el span.
+        No cambia la frecuencia escuchada (dial)."""
+        # Si el escáner está corriendo, no peleamos
+        try:
+            if getattr(self, "scanner", None) is not None and getattr(self.scanner, "is_running", False):
+                return
+        except Exception:
+            pass
+
+        new_center_mhz = float(new_center_mhz)
+
+        # throttle: evita retunes repetidos casi iguales
+        try:
+            cur_span_c = getattr(self, "_last_span_center_mhz", None)
+            if cur_span_c is None and hasattr(self, "freq_spin") and self.freq_spin is not None:
+                cur_span_c = float(self.freq_spin.value())
+            if cur_span_c is not None and abs(new_center_mhz - float(cur_span_c)) < 0.00005:  # ~50 Hz
+                return
+        except Exception:
+            pass
+
+        try:
+            if self.active_driver is not None and hasattr(self.active_driver, "set_center_freq"):
+                self.active_driver.set_center_freq(new_center_mhz * 1e6)
+        except Exception:
+            pass
+
 
 
 

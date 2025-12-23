@@ -30,6 +30,8 @@ class WaterfallWidget(QWidget):
     }
 
     sig_view_window_changed = QtCore.Signal(float, float, bool)  # x0_mhz, x1_mhz, final
+    sig_nav_edge_recenter = QtCore.Signal(float)
+
 
 
     def __init__(self, parent=None, history_lines: int = 420, default_width: int = 512):
@@ -324,16 +326,35 @@ class WaterfallWidget(QWidget):
 
         # regla abajo
         try:
+            # Preserva la ventana del selector (no la resetees en cada frame)
+            prev = None
+            try:
+                prev = self.nav_region.getRegion()
+            except Exception:
+                prev = None
+
             self.nav.setXRange(x0, x1, padding=0.0)
+
             span = max(0.00005, x1 - x0)
-            # selector inicial: 25% del span centrado
-            w = span * 0.25
-            c = (x0 + x1) / 2.0
-            self.set_nav_window(c - w/2.0, c + w/2.0)
+            if prev is not None:
+                p0, p1 = prev
+                p0 = float(p0); p1 = float(p1)
+                if p1 < p0:
+                    p0, p1 = p1, p0
+                w = max(0.00005, p1 - p0)
+                c = (p0 + p1) / 2.0
+                w = min(w, span)
+                self.set_nav_window(c - w/2.0, c + w/2.0)
+            else:
+                # selector inicial: 25% del span centrado
+                w = span * 0.25
+                c = (x0 + x1) / 2.0
+                self.set_nav_window(c - w/2.0, c + w/2.0)
         except Exception:
             pass
 
         self._update_marker()
+
 
 
     def set_tuned_freq(self, hz: float):
@@ -540,6 +561,30 @@ class WaterfallWidget(QWidget):
         if self._sync_nav_region:
             return
         self._emit_nav_window(True)
+
+        # Si el selector llega a un tope y sueltas, pide recenter del span (para poder seguir avanzando)
+        try:
+            xmin = float(self._f_start_hz) / 1e6
+            xmax = float(self._f_stop_hz) / 1e6
+            if xmax < xmin:
+                xmin, xmax = xmax, xmin
+
+            x0, x1 = self.nav_region.getRegion()
+            x0 = float(x0); x1 = float(x1)
+            if x1 < x0:
+                x0, x1 = x1, x0
+
+            w = max(0.00005, x1 - x0)
+            margin = max(w * 0.08, 0.00010)  # 8% del ancho o 100 Hz
+            hit_left = (x0 - xmin) <= margin
+            hit_right = (xmax - x1) <= margin
+
+            if hit_left or hit_right:
+                c = (x0 + x1) / 2.0
+                self.sig_nav_edge_recenter.emit(float(c))
+        except Exception:
+            pass
+
 
     # ---- Drag de la línea verde (retune) ----
     def _on_tune_line_live(self):
