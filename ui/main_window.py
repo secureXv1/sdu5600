@@ -192,16 +192,6 @@ class SpectrumNavBar(QWidget):
         self.vb = self.plot.getViewBox()
         self.vb.setLimits(minXRange=0.00005)
 
-                # ==========================================================
-        # Rueda del mouse: NO hace zoom. Desplaza la frecuencia (línea verde)
-        # Paso: 0.5 kHz = 0.0005 MHz (ajústalo si quieres 0.5 MHz)
-        # ==========================================================
-        self._wheel_step_mhz = 0.0005
-        try:
-            self._orig_plot_wheel = self.plot.wheelEvent
-            self.plot.wheelEvent = self._on_plot_wheel_tune
-        except Exception:
-            pass
 
 
         # rectángulo de vista (la “regla”)
@@ -476,6 +466,13 @@ class SpectrumWidget(QWidget):
         self.vb = self.plot.getViewBox()
         self.vb.setLimits(minXRange=0.00005)
 
+        self._wheel_step_mhz = 0.0005
+        try:
+            self._orig_vb_wheel = self.vb.wheelEvent
+            self.vb.wheelEvent = self._on_vb_wheel_tune
+        except Exception:
+            pass
+
         # ======================
         # Curva: AVG (suave)
         # ======================
@@ -650,6 +647,102 @@ class SpectrumWidget(QWidget):
         except Exception:
             pass
         return x_mhz
+    
+
+
+    
+
+    def _on_vb_wheel_tune(self, ev, axis=None):
+        """Wheel en el espectro:
+        - Ctrl + wheel => zoom (comportamiento nativo)
+        - wheel        => desplaza la frecuencia (línea verde) en pasos fijos
+        """
+
+        # Ctrl + rueda: dejar que pyqtgraph haga zoom
+        try:
+            mods = ev.modifiers()
+            if mods & Qt.ControlModifier:
+                try:
+                    return self._orig_vb_wheel(ev, axis)
+                except TypeError:
+                    return self._orig_vb_wheel(ev)
+        except Exception:
+            pass
+
+                # rueda normal: mover frecuencia
+        # rueda normal: mover frecuencia (QGraphicsSceneWheelEvent usa delta())
+        dy = 0
+
+        # 1) QWheelEvent
+        try:
+            dy = int(ev.angleDelta().y())
+        except Exception:
+            dy = 0
+
+        # 2) QGraphicsSceneWheelEvent (pyqtgraph ViewBox)
+        if dy == 0:
+            try:
+                dy = int(ev.delta())
+            except Exception:
+                dy = 0
+
+        # 3) trackpads (pixelDelta) - fallback
+        steps = 0.0
+        if dy != 0:
+            steps = float(dy) / 120.0
+        else:
+            try:
+                pd = ev.pixelDelta().y()
+                if pd != 0:
+                    steps = float(pd) / 60.0  # escala cómoda
+            except Exception:
+                steps = 0.0
+
+        if steps == 0.0:
+            try:
+                ev.ignore()
+            except Exception:
+                pass
+            return
+
+        step_mhz = float(getattr(self, "_wheel_step_mhz", 0.0005))
+
+        try:
+            cur = float(self.tune_center.value())
+        except Exception:
+            cur = float(getattr(self, "_tuned_mhz", 0.0) or 0.0)
+
+        new_mhz = cur + steps * step_mhz
+
+        # clamp al rango visible
+        try:
+            xmin, xmax = self.vb.viewRange()[0]
+            xmin = float(xmin); xmax = float(xmax)
+            if xmax < xmin:
+                xmin, xmax = xmax, xmin
+            new_mhz = max(xmin, min(xmax, new_mhz))
+        except Exception:
+            pass
+
+        # mover la línea verde
+        try:
+            self._sync_lock = True
+            self.tune_center.setValue(float(new_mhz))
+        except Exception:
+            pass
+        finally:
+            self._sync_lock = False
+
+        try:
+            self.sig_tune.emit(float(new_mhz), False)
+        except Exception:
+            pass
+
+        try:
+            ev.accept()
+        except Exception:
+            pass
+
 
     def _on_scene_mouse_clicked(self, ev):
         try:
