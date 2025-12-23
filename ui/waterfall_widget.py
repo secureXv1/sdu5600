@@ -97,6 +97,23 @@ class WaterfallWidget(QWidget):
         self.nav.hideButtons()
         self.nav.setMouseEnabled(x=False, y=False)
 
+                # ==========================================================
+        # Rueda del mouse: NO hace zoom. Desplaza la frecuencia (línea verde)
+        # Paso: 0.5 kHz = 0.0005 MHz (ajústalo si quieres 0.5 MHz)
+        # ==========================================================
+        self._wheel_step_mhz = 0.0005
+        try:
+            self._orig_view_wheel = self.view.wheelEvent
+            self.view.wheelEvent = self._on_view_wheel_tune
+        except Exception:
+            pass
+        try:
+            self._orig_nav_wheel = self.nav.wheelEvent
+            self.nav.wheelEvent = self._on_view_wheel_tune
+        except Exception:
+            pass
+
+
         nav_pi = self.nav.getPlotItem()
         nav_pi.showAxis("bottom")
         nav_pi.getAxis("bottom").setTextPen(pg.mkPen("#cbd5e1"))
@@ -112,12 +129,16 @@ class WaterfallWidget(QWidget):
         layout.addWidget(self.nav)
 
         self._sync_nav_region = False
+
+        #RECTANGULO DEL DIAL
         self.nav_region = pg.LinearRegionItem(
             values=[0.0, 0.0],
             movable=True,
             swapMode="push",
-            brush=pg.mkBrush(255, 255, 255, 25),          # gris suave (no ventana verde)
-            pen=pg.mkPen(255, 255, 255, 120, width=1),
+            # Más visible (menos transparente) + borde más grueso
+            # (verde suave para que destaque sin tapar demasiado)
+            brush=pg.mkBrush(34, 197, 94, 70),          # <-- sube/baja este alpha (0-255)
+            pen=pg.mkPen(34, 197, 94, 230, width=2),    # <-- borde más fuerte
         )
         self.nav_region.setZValue(5)
         nav_pi.addItem(self.nav_region)
@@ -608,6 +629,52 @@ class WaterfallWidget(QWidget):
         self._tuned_hz = mhz * 1e6
         self._update_marker()
         self.sig_tune.emit(float(mhz), True)
+
+
+    def _on_view_wheel_tune(self, ev):
+        """Intercepta la rueda para mover la frecuencia (sin zoom)."""
+        try:
+            dy = ev.angleDelta().y()
+        except Exception:
+            dy = 0
+
+        if dy == 0:
+            try:
+                ev.ignore()
+            except Exception:
+                pass
+            return
+
+        steps = float(dy) / 120.0
+        step_mhz = float(getattr(self, "_wheel_step_mhz", 0.0005))
+
+        # frecuencia actual (tuned)
+        try:
+            cur_mhz = float(getattr(self, "_tuned_hz", 0.0)) / 1e6
+        except Exception:
+            cur_mhz = 0.0
+
+        new_mhz = cur_mhz + steps * step_mhz
+
+        # clamp al rango visible del waterfall
+        try:
+            xmin = float(self._f_start_hz) / 1e6
+            xmax = float(self._f_stop_hz) / 1e6
+            if xmax < xmin:
+                xmin, xmax = xmax, xmin
+            new_mhz = max(xmin, min(xmax, new_mhz))
+        except Exception:
+            pass
+
+        try:
+            self.sig_tune.emit(float(new_mhz), False)
+        except Exception:
+            pass
+
+        try:
+            ev.accept()
+        except Exception:
+            pass
 
 
 

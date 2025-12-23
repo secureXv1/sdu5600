@@ -192,6 +192,18 @@ class SpectrumNavBar(QWidget):
         self.vb = self.plot.getViewBox()
         self.vb.setLimits(minXRange=0.00005)
 
+                # ==========================================================
+        # Rueda del mouse: NO hace zoom. Desplaza la frecuencia (línea verde)
+        # Paso: 0.5 kHz = 0.0005 MHz (ajústalo si quieres 0.5 MHz)
+        # ==========================================================
+        self._wheel_step_mhz = 0.0005
+        try:
+            self._orig_plot_wheel = self.plot.wheelEvent
+            self.plot.wheelEvent = self._on_plot_wheel_tune
+        except Exception:
+            pass
+
+
         # rectángulo de vista (la “regla”)
         self.region = pg.LinearRegionItem(
             values=[0.0, 0.0],
@@ -876,6 +888,72 @@ class SpectrumWidget(QWidget):
             pass
         finally:
             self._sync_lock = False
+
+
+
+    def _on_plot_wheel_tune(self, ev):
+        """Intercepta la rueda para mover la frecuencia (sin zoom)."""
+        try:
+            dy = ev.angleDelta().y()
+        except Exception:
+            dy = 0
+
+        if dy == 0:
+            try:
+                ev.ignore()
+            except Exception:
+                pass
+            return
+
+        steps = float(dy) / 120.0  # 120 por notch típico
+        step_mhz = float(getattr(self, "_wheel_step_mhz", 0.0005))
+        new_mhz = None
+
+        try:
+            cur = float(self.tune_center.value())
+            new_mhz = cur + steps * step_mhz
+        except Exception:
+            try:
+                cur = float(getattr(self, "_tuned_mhz", 0.0))
+                new_mhz = cur + steps * step_mhz
+            except Exception:
+                new_mhz = None
+
+        if new_mhz is None:
+            try:
+                ev.accept()
+            except Exception:
+                pass
+            return
+
+        # clamp al rango visible
+        try:
+            xmin, xmax = self.vb.viewRange()[0]
+            xmin = float(xmin); xmax = float(xmax)
+            if xmax < xmin:
+                xmin, xmax = xmax, xmin
+            new_mhz = max(xmin, min(xmax, new_mhz))
+        except Exception:
+            pass
+
+        # mueve la línea verde y emite tune (MainWindow ya hace throttle)
+        try:
+            self.tune_center.blockSignals(True)
+            self.tune_center.setValue(float(new_mhz))
+            self.tune_center.blockSignals(False)
+        except Exception:
+            pass
+
+        try:
+            self.sig_tune.emit(float(new_mhz), False)
+        except Exception:
+            pass
+
+        try:
+            ev.accept()
+        except Exception:
+            pass
+
 
     def _on_region_changed_final(self):
         try:
