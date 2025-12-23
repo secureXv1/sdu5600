@@ -18,7 +18,8 @@ class WaterfallWidget(QWidget):
     - Click/drag para sintonizar
     """
     sig_tune = QtCore.Signal(float, bool)
-
+    # Selector de vista (rectángulo) para navegar el rango SIN cambiar frecuencia sintonizada
+    sig_view_center_changed = QtCore.Signal(float, bool)  # center_mhz, final
     MODE_BW_HZ = {
         "NFM": 12_500,
         "FMN": 12_500,
@@ -27,6 +28,9 @@ class WaterfallWidget(QWidget):
         "LSB": 2_700,
         "FM": 200_000,
     }
+
+    sig_view_window_changed = QtCore.Signal(float, float, bool)  # x0_mhz, x1_mhz, final
+
 
     def __init__(self, parent=None, history_lines: int = 420, default_width: int = 512):
         super().__init__(parent)
@@ -82,6 +86,52 @@ class WaterfallWidget(QWidget):
 
         layout.addWidget(self.view)
 
+                # ----------------------------
+        # NAV BAR (regla inferior para navegar rangos)
+        # ----------------------------
+        self.nav = pg.PlotWidget()
+        self.nav.setFixedHeight(38)
+        self.nav.setMenuEnabled(False)
+        self.nav.hideButtons()
+        self.nav.setMouseEnabled(x=False, y=False)
+
+        nav_pi = self.nav.getPlotItem()
+        nav_pi.showAxis("bottom")
+        nav_pi.getAxis("bottom").setTextPen(pg.mkPen("#cbd5e1"))
+        nav_pi.getAxis("bottom").setPen(pg.mkPen("#6b7280"))
+        nav_pi.hideAxis("left")
+        nav_pi.setContentsMargins(0, 0, 0, 0)
+        nav_pi.vb.setDefaultPadding(0)
+
+        # Y fijo (solo para dibujar el selector)
+        self.nav.setYRange(0, 1, padding=0.0)
+        self.nav.enableAutoRange(x=False, y=False)
+
+        layout.addWidget(self.nav)
+
+        self._sync_nav_region = False
+        self.nav_region = pg.LinearRegionItem(
+            values=[0.0, 0.0],
+            movable=True,
+            swapMode="push",
+            brush=pg.mkBrush(255, 255, 255, 25),          # gris suave (no ventana verde)
+            pen=pg.mkPen(255, 255, 255, 120, width=1),
+        )
+        self.nav_region.setZValue(5)
+        nav_pi.addItem(self.nav_region)
+
+        # Línea tuned en la regla (opcional, ayuda visual)
+        self.nav_tuned = pg.InfiniteLine(
+            angle=90, movable=False,
+            pen=pg.mkPen("#22c55e", width=1.3)
+        )
+        self.nav_tuned.setZValue(6)
+        nav_pi.addItem(self.nav_tuned)
+
+        self.nav_region.sigRegionChanged.connect(self._on_nav_region_live)
+        self.nav_region.sigRegionChangeFinished.connect(self._on_nav_region_final)
+
+
         # freq mapping
         self._f_start_hz = 0.0
         self._f_stop_hz = float(self.width)
@@ -92,12 +142,32 @@ class WaterfallWidget(QWidget):
         self._tuned_hz = None
 
         # Tune lines: izquierda/centro/derecha
+        self._sync_tune_line = False
         self.tune_left = pg.InfiniteLine(angle=90, movable=False, pen=pg.mkPen("#22c55e", width=1.1))
-        self.tune_center = pg.InfiniteLine(angle=90, movable=False, pen=pg.mkPen("#22c55e", width=2.0))
+        self.tune_center = pg.InfiniteLine(
+            angle=90,
+            movable=True,  # ✅ ahora se puede arrastrar
+            pen=pg.mkPen("#22c55e", width=2.2),
+            hoverPen=pg.mkPen("#86efac", width=3.0),
+        )
         self.tune_right = pg.InfiniteLine(angle=90, movable=False, pen=pg.mkPen("#22c55e", width=1.1))
         self.plot.addItem(self.tune_left)
         self.plot.addItem(self.tune_center)
+        self.tune_center.sigPositionChanged.connect(self._on_tune_line_live)
+        self.tune_center.sigPositionChangeFinished.connect(self._on_tune_line_final)
         self.plot.addItem(self.tune_right)
+
+        # Selector de vista (rectángulo) para mover el rango visible del espectro superior
+        self._sync_view_region = False
+        self._view_w_mhz = None
+
+
+
+
+        # Drag de la línea verde -> retune
+        self.tune_center.sigPositionChanged.connect(self._on_tune_line_live)
+        self.tune_center.sigPositionChangeFinished.connect(self._on_tune_line_final)
+
 
         # Badge inferior-centro (Freq/Span)
         self.center_box = pg.TextItem(color="#e5e7eb", anchor=(0.5, 0.5))
@@ -133,6 +203,20 @@ class WaterfallWidget(QWidget):
         )
         self._rect_dirty = False
 
+        # región por defecto (si aún no existe)
+        if self._view_w_mhz is None:
+            try:
+                span_mhz = abs(self._f_stop_hz - self._f_start_hz) / 1e6
+                self._view_w_mhz = max(0.0002, span_mhz * 0.25)
+            except Exception:
+                self._view_w_mhz = 0.002
+        try:
+            c = ((self._f_start_hz + self._f_stop_hz) / 2.0) / 1e6
+            self.set_view_center(c, self._view_w_mhz)
+        except Exception:
+            pass
+
+
     def _update_marker(self):
         if self._tuned_hz is None:
             return
@@ -143,9 +227,15 @@ class WaterfallWidget(QWidget):
         center = c_hz / 1e6
         right = (c_hz + bw / 2.0) / 1e6
 
-        self.tune_left.setPos(left)
-        self.tune_center.setPos(center)
-        self.tune_right.setPos(right)
+        # al mover programáticamente la línea verde, evitamos re-emisiones
+        self._sync_tune_line = True
+        try:
+            self.tune_left.setPos(left)
+            self.tune_center.setPos(center)
+            self.tune_right.setPos(right)
+        finally:
+            self._sync_tune_line = False
+
 
         x_center_mhz = ((self._f_start_hz + self._f_stop_hz) / 2.0) / 1e6
         self.center_box.setPos(x_center_mhz, self.history_lines * 0.82)
@@ -226,8 +316,25 @@ class WaterfallWidget(QWidget):
         self._f_start_hz = float(start_hz)
         self._f_stop_hz = float(stop_hz)
         self._rect_dirty = True
-        self.plot.setXRange(self._f_start_hz / 1e6, self._f_stop_hz / 1e6, padding=0.0)
+
+        x0 = self._f_start_hz / 1e6
+        x1 = self._f_stop_hz / 1e6
+
+        self.plot.setXRange(x0, x1, padding=0.0)
+
+        # regla abajo
+        try:
+            self.nav.setXRange(x0, x1, padding=0.0)
+            span = max(0.00005, x1 - x0)
+            # selector inicial: 25% del span centrado
+            w = span * 0.25
+            c = (x0 + x1) / 2.0
+            self.set_nav_window(c - w/2.0, c + w/2.0)
+        except Exception:
+            pass
+
         self._update_marker()
+
 
     def set_tuned_freq(self, hz: float):
         self._tuned_hz = float(hz)
@@ -243,6 +350,12 @@ class WaterfallWidget(QWidget):
             f"Freq: {mhz:.6f} MHz<br/>Span: ±{span_khz/2.0:.0f} kHz"
             "</div>"
         )
+
+        try:
+            self.nav_tuned.setPos(self._tuned_hz / 1e6)
+        except Exception:
+            pass
+
 
     # ----------------------------
     # Dial manual (mouse)
@@ -294,6 +407,163 @@ class WaterfallWidget(QWidget):
 
         self._drag_tuning = True
         self.sig_tune.emit(float(mhz), False)
+
+
+    # ----------------------------
+    # Selector de vista (rectángulo)
+    # ----------------------------
+    def _clamp_mhz(self, x_mhz: float) -> float:
+        xmin = float(self._f_start_hz) / 1e6
+        xmax = float(self._f_stop_hz) / 1e6
+        if xmax < xmin:
+            xmin, xmax = xmax, xmin
+        return max(xmin, min(xmax, float(x_mhz)))
+
+    def set_view_center(self, center_mhz: float, width_mhz: float | None = None):
+        if width_mhz is not None:
+            self._view_w_mhz = max(0.00005, float(width_mhz))
+        if self._view_w_mhz is None:
+            return
+
+        w = float(self._view_w_mhz)
+        c = self._clamp_mhz(float(center_mhz))
+        left = c - w / 2.0
+        right = c + w / 2.0
+
+        xmin = float(self._f_start_hz) / 1e6
+        xmax = float(self._f_stop_hz) / 1e6
+        if xmax < xmin:
+            xmin, xmax = xmax, xmin
+        if left < xmin:
+            left = xmin
+            right = left + w
+        if right > xmax:
+            right = xmax
+            left = right - w
+
+        self._sync_view_region = True
+        try:
+            self.view_region.setRegion((left, right))
+        finally:
+            self._sync_view_region = False
+
+    def set_view_window(self, x0_mhz: float, x1_mhz: float):
+        x0 = float(x0_mhz)
+        x1 = float(x1_mhz)
+        if x1 < x0:
+            x0, x1 = x1, x0
+        w = max(0.00005, x1 - x0)
+        c = (x0 + x1) / 2.0
+        self.set_view_center(c, w)
+
+    def _emit_view_center(self, final: bool):
+        try:
+            left, right = self.view_region.getRegion()
+            c = (float(left) + float(right)) / 2.0
+            self.sig_view_center_changed.emit(float(c), bool(final))
+        except Exception:
+            pass
+
+    def _on_view_region_live(self):
+        if self._sync_view_region:
+            return
+        self._emit_view_center(False)
+
+    def _on_view_region_final(self):
+        if self._sync_view_region:
+            return
+        self._emit_view_center(True)
+
+    # ----------------------------
+    # Drag de la línea verde (retune)
+    # ----------------------------
+    def _on_tune_line_live(self):
+        if self._sync_tune_line:
+            return
+        try:
+            mhz = self._clamp_mhz(float(self.tune_center.value()))
+        except Exception:
+            return
+        # feedback inmediato
+        self._tuned_hz = mhz * 1e6
+        self._update_marker()
+        self.sig_tune.emit(float(mhz), False)
+
+    def _on_tune_line_final(self):
+        if self._sync_tune_line:
+            return
+        try:
+            mhz = self._clamp_mhz(float(self.tune_center.value()))
+        except Exception:
+            return
+        self._tuned_hz = mhz * 1e6
+        self._update_marker()
+        self.sig_tune.emit(float(mhz), True)
+
+
+    def _clamp_mhz(self, x_mhz: float) -> float:
+        xmin = float(self._f_start_hz) / 1e6
+        xmax = float(self._f_stop_hz) / 1e6
+        if xmax < xmin:
+            xmin, xmax = xmax, xmin
+        return max(xmin, min(xmax, float(x_mhz)))
+
+    def set_nav_window(self, x0_mhz: float, x1_mhz: float):
+        x0 = float(x0_mhz)
+        x1 = float(x1_mhz)
+        if x1 < x0:
+            x0, x1 = x1, x0
+        x0 = self._clamp_mhz(x0)
+        x1 = self._clamp_mhz(x1)
+        if x1 <= x0:
+            x1 = x0 + 0.00005
+
+        self._sync_nav_region = True
+        try:
+            self.nav_region.setRegion((x0, x1))
+        finally:
+            self._sync_nav_region = False
+
+    def _emit_nav_window(self, final: bool):
+        try:
+            x0, x1 = self.nav_region.getRegion()
+            self.sig_view_window_changed.emit(float(x0), float(x1), bool(final))
+        except Exception:
+            pass
+
+    def _on_nav_region_live(self):
+        if self._sync_nav_region:
+            return
+        self._emit_nav_window(False)
+
+    def _on_nav_region_final(self):
+        if self._sync_nav_region:
+            return
+        self._emit_nav_window(True)
+
+    # ---- Drag de la línea verde (retune) ----
+    def _on_tune_line_live(self):
+        if self._sync_tune_line:
+            return
+        try:
+            mhz = self._clamp_mhz(float(self.tune_center.value()))
+        except Exception:
+            return
+        self._tuned_hz = mhz * 1e6
+        self._update_marker()
+        self.sig_tune.emit(float(mhz), False)
+
+    def _on_tune_line_final(self):
+        if self._sync_tune_line:
+            return
+        try:
+            mhz = self._clamp_mhz(float(self.tune_center.value()))
+        except Exception:
+            return
+        self._tuned_hz = mhz * 1e6
+        self._update_marker()
+        self.sig_tune.emit(float(mhz), True)
+
 
 
 

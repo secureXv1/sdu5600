@@ -200,6 +200,21 @@ class SpectrumNavBar(QWidget):
             brush=pg.mkBrush(34, 197, 94, 45),
             pen=pg.mkPen(34, 197, 94, 190, width=1),
         )
+
+                # línea "tuned" (la frecuencia que estás escuchando) -> NO cambia al mover el rectángulo
+        self.tuned_line = pg.InfiniteLine(
+            angle=90,
+            movable=False,
+            pen=pg.mkPen(34, 197, 94, 220, width=1)
+        )
+        self.tuned_line.setZValue(9)
+        self.plot.addItem(self.tuned_line)
+
+        # click en la barra: centra el rectángulo en ese punto (solo vista)
+        self.plot.scene().sigMouseClicked.connect(self._on_scene_clicked)
+
+
+
         self.region.setZValue(10)
         self.plot.addItem(self.region)
 
@@ -306,6 +321,42 @@ class SpectrumNavBar(QWidget):
                 self.sig_edge_recenter.emit(float(new_center))
         except Exception:
             pass
+
+    def set_tuned_freq(self, mhz: float | None):
+        """Muestra en la mini-barra la frecuencia escuchada (solo indicador)."""
+        if mhz is None or self._xmin is None or self._xmax is None:
+            try:
+                self.tuned_line.setVisible(False)
+            except Exception:
+                pass
+            return
+
+        x = float(mhz)
+        vis = (self._xmin <= x <= self._xmax)
+        try:
+            self.tuned_line.setVisible(bool(vis))
+            if vis:
+                self.tuned_line.setPos(x)
+        except Exception:
+            pass
+
+    def _on_scene_clicked(self, ev):
+        """Click en la regla: mueve el rectángulo (vista) sin tocar el tune."""
+        try:
+            if ev.button() != Qt.LeftButton:
+                return
+            p = self.vb.mapSceneToView(ev.scenePos())
+            x = float(p.x())
+        except Exception:
+            return
+
+        # mover vista al click (equivalente a arrastrar el rectángulo)
+        self.set_view_center(x)
+
+        # emite como "final" para que el espectro haga el salto limpio
+        self._emit_center(True)
+
+
 
 
 
@@ -613,6 +664,13 @@ class SpectrumWidget(QWidget):
         try:
             self._tuned_mhz = float(mhz)
             self._refresh_channel_marker()
+        except Exception:
+            pass
+
+        # mini-barra: línea tuned SIEMPRE sigue la frecuencia escuchada
+        try:
+            if hasattr(self, "navbar") and self.navbar is not None:
+                self.navbar.set_tuned_freq(self._tuned_mhz)
         except Exception:
             pass
 
@@ -1017,9 +1075,7 @@ class MainWindow(QMainWindow):
         self.spectrum = SpectrumWidget()
 
         
-        self.spectrum.navbar.sig_center_changed.connect(self.spectrum._on_nav_center)
-
-
+       
                 # =========================
         # Dial manual desde espectro
         # =========================
@@ -1046,6 +1102,22 @@ class MainWindow(QMainWindow):
         self.bandbar = BandBar("MARINE VHF")  # puedes cambiar dinámicamente luego
         
         self.waterfall = WaterfallWidget()
+
+
+
+        try:
+            self.waterfall.sig_view_window_changed.connect(self._on_waterfall_nav_window)
+        except Exception:
+            pass
+
+        # sincronizar selector cuando el espectro superior cambia su vista (zoom/pan)
+        try:
+            self.spectrum.vb.sigRangeChanged.connect(self._sync_waterfall_nav_from_spectrum)
+        except Exception:
+            pass
+
+
+
         self.bandbar = BandBar("—")
 
                         # =========================
@@ -1828,6 +1900,26 @@ class MainWindow(QMainWindow):
                 self._wf_tune_timer.start()
 
 
+    # ---------- Waterfall selector (solo vista) ----------
+    def _on_waterfall_view_center(self, center_mhz: float, final: bool):
+        """Rectángulo en waterfall: cambia el rango visible del espectro superior sin retunear."""
+        try:
+            self.spectrum._on_nav_center(float(center_mhz), bool(final))
+        except Exception:
+            pass
+
+    def _sync_waterfall_view_from_spectrum(self, *_):
+        """Mantiene el rectángulo del waterfall alineado con el XRange actual del espectro superior."""
+        try:
+            (xr, _yr) = self.spectrum.plot.viewRange()
+            x0 = float(xr[0]); x1 = float(xr[1])
+            if hasattr(self, "waterfall") and self.waterfall is not None:
+                self.waterfall.set_view_window(x0, x1)
+        except Exception:
+            pass
+
+
+
 
     # ---------- Monitor ----------
     
@@ -2098,6 +2190,7 @@ class MainWindow(QMainWindow):
         try:
             self.waterfall.set_freq_axis(freqs[0], freqs[-1])
             self.waterfall.set_tuned_freq(float(tuned_mhz) * 1e6)
+            self._sync_waterfall_view_from_spectrum()
         except Exception:
             pass
 
@@ -2361,6 +2454,24 @@ class MainWindow(QMainWindow):
             self._refresh_scanner_panel()
         except Exception as e:
             QMessageBox.warning(self, "Eliminar", str(e))
+
+
+
+    def _on_waterfall_nav_window(self, x0_mhz: float, x1_mhz: float, final: bool):
+        """Selector de la regla inferior: SOLO cambia la vista del espectro superior (no retunea)."""
+        try:
+            self.spectrum.plot.setXRange(float(x0_mhz), float(x1_mhz), padding=0.0)
+        except Exception:
+            pass
+
+    def _sync_waterfall_nav_from_spectrum(self, *_):
+        """Mantiene el selector inferior alineado con lo que se ve arriba."""
+        try:
+            xr = self.spectrum.plot.viewRange()[0]
+            x0 = float(xr[0]); x1 = float(xr[1])
+            self.waterfall.set_nav_window(x0, x1)
+        except Exception:
+            pass
 
 
 
