@@ -125,6 +125,9 @@ class WaterfallWidget(QWidget):
         # Y fijo (solo para dibujar el selector)
         self.nav.setYRange(0, 1, padding=0.0)
         self.nav.enableAutoRange(x=False, y=False)
+        # Factor 6.0 = 6x el ancho del rango visible.
+        self._nav_overview_factor = 6.0
+
 
         layout.addWidget(self.nav)
 
@@ -158,6 +161,8 @@ class WaterfallWidget(QWidget):
         # freq mapping
         self._f_start_hz = 0.0
         self._f_stop_hz = float(self.width)
+        self._nav_start_hz = self._f_start_hz
+        self._nav_stop_hz = self._f_stop_hz
         self._rect_dirty = True
 
         # Modo/ancho para marcador
@@ -336,45 +341,58 @@ class WaterfallWidget(QWidget):
         self.img_item.setImage(self.img, autoLevels=False, levels=self.levels)
 
     def set_freq_axis(self, start_hz: float, stop_hz: float):
+        # Rango REAL visible del waterfall/espectro superior
         self._f_start_hz = float(start_hz)
         self._f_stop_hz = float(stop_hz)
         self._rect_dirty = True
 
         x0 = self._f_start_hz / 1e6
         x1 = self._f_stop_hz / 1e6
+        if x1 < x0:
+            x0, x1 = x1, x0
 
         self.plot.setXRange(x0, x1, padding=0.0)
 
-        # regla abajo
+        # -----------------------------
+        # Regla inferior (NAV): overview más amplio
+        # -----------------------------
         try:
-            # Preserva la ventana del selector (no la resetees en cada frame)
             prev = None
             try:
                 prev = self.nav_region.getRegion()
             except Exception:
                 prev = None
 
-            self.nav.setXRange(x0, x1, padding=0.0)
-
             span = max(0.00005, x1 - x0)
+            c = (x0 + x1) / 2.0
+
+            factor = float(getattr(self, "_nav_overview_factor", 6.0) or 6.0)
+            factor = max(1.0, factor)
+            nav_span = max(span, span * factor)
+
+            nx0 = c - nav_span / 2.0
+            nx1 = c + nav_span / 2.0
+
+            # guarda límites para clamps del NAV
+            self._nav_start_hz = nx0 * 1e6
+            self._nav_stop_hz = nx1 * 1e6
+
+            self.nav.setXRange(nx0, nx1, padding=0.0)
+
+            # Rectángulo = ventana visible actual (por defecto)
             if prev is not None:
                 p0, p1 = prev
                 p0 = float(p0); p1 = float(p1)
                 if p1 < p0:
                     p0, p1 = p1, p0
-                w = max(0.00005, p1 - p0)
-                c = (p0 + p1) / 2.0
-                w = min(w, span)
-                self.set_nav_window(c - w/2.0, c + w/2.0)
+                self.set_nav_window(p0, p1)
             else:
-                # selector inicial: 25% del span centrado
-                w = span * 0.25
-                c = (x0 + x1) / 2.0
-                self.set_nav_window(c - w/2.0, c + w/2.0)
+                self.set_nav_window(x0, x1)
         except Exception:
             pass
 
         self._update_marker()
+
 
 
 
@@ -460,6 +478,15 @@ class WaterfallWidget(QWidget):
         if xmax < xmin:
             xmin, xmax = xmax, xmin
         return max(xmin, min(xmax, float(x_mhz)))
+    
+    def _clamp_nav_mhz(self, x_mhz: float) -> float:
+        """Clamp para el overview de la regla inferior (NAV)."""
+        xmin = float(getattr(self, "_nav_start_hz", self._f_start_hz)) / 1e6
+        xmax = float(getattr(self, "_nav_stop_hz", self._f_stop_hz)) / 1e6
+        if xmax < xmin:
+            xmin, xmax = xmax, xmin
+        return max(xmin, min(xmax, float(x_mhz)))
+
 
     def set_view_center(self, center_mhz: float, width_mhz: float | None = None):
         if width_mhz is not None:
@@ -555,8 +582,8 @@ class WaterfallWidget(QWidget):
         x1 = float(x1_mhz)
         if x1 < x0:
             x0, x1 = x1, x0
-        x0 = self._clamp_mhz(x0)
-        x1 = self._clamp_mhz(x1)
+        x0 = self._clamp_nav_mhz(x0)
+        x1 = self._clamp_nav_mhz(x1)
         if x1 <= x0:
             x1 = x0 + 0.00005
 
