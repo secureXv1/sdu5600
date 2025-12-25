@@ -1418,6 +1418,12 @@ class MainWindow(QMainWindow):
 
         self._apply_theme()
 
+        try:
+            QtCore.QTimer.singleShot(0, self._prime_fft_and_tune)
+        except Exception:
+            pass
+
+
     # ---------- Docks ----------
     def _build_controls_dock_left(self):
         panel = QWidget()
@@ -2103,6 +2109,54 @@ class MainWindow(QMainWindow):
                 QMessageBox.warning(self, "TUNE", f"No se pudo sintonizar: {e}")
 
 
+    def _prime_fft_and_tune(self):
+        """Conecta y fija center_freq al arranque para que el espectro aparezca de una."""
+        drv = getattr(self, "active_driver", None)
+        if drv is None:
+            return
+
+        # 1) Conectar driver
+        try:
+            if hasattr(drv, "connect"):
+                drv.connect()
+            # por si tu driver usa flag "connected"
+            if hasattr(drv, "connected"):
+                setattr(drv, "connected", True)
+        except Exception:
+            pass
+
+        # 2) Fijar center_freq inicial (sin depender de click)
+        try:
+            mhz = float(self.freq_spin.value())
+        except Exception:
+            mhz = 91.4
+
+        try:
+            if hasattr(drv, "set_center_freq"):
+                drv.set_center_freq(mhz * 1e6)
+        except Exception:
+            pass
+
+        # 3) Reset de promedio/offset para que NO haya “bajada”
+        try:
+            self._spec_offset_db = None
+        except Exception:
+            pass
+        try:
+            self.spectrum._avg = None
+            self.spectrum._last_x = None
+            self.spectrum._x_inited = False
+        except Exception:
+            pass
+
+        # 4) Fuerza primer update pronto
+        try:
+            QtCore.QTimer.singleShot(30, self._update_from_active_device)
+        except Exception:
+            pass
+        
+
+
     def _on_waterfall_tune(self, mhz: float, final: bool):
             # Si el escáner está corriendo, evitamos que el dial pelee con el scanner
                 try:
@@ -2374,6 +2428,16 @@ class MainWindow(QMainWindow):
                 self.bandbar.set_text("FM BROADCAST")
             else:
                 self.bandbar.set_text("—")
+        except Exception:
+            pass
+
+        try:
+            lv = levels_for_spec[np.isfinite(levels_for_spec)]
+            if lv.size:
+                dyn = float(np.max(lv) - np.min(lv))
+                # si la dinámica es muy baja, probablemente es “basura”/flat -> no inicializar avg
+                if dyn < 0.5:   # dB (ajústalo a 0.3 si quieres más estricto)
+                    return
         except Exception:
             pass
 
